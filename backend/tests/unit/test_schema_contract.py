@@ -12,12 +12,13 @@ def test_phase1_schema_has_required_constraints_and_indexes():
     ai=Base.metadata.tables["ai_runs"]; assert {"ck_ai_input_tokens","ck_ai_output_tokens"} <= {c.name for c in ai.constraints}
 
 def test_all_design_tables_exist():
-    assert {"feeds","fetch_runs","articles","events","event_articles","reviews","event_revisions","ai_runs","jobs","users","sessions","audit_logs"} == set(Base.metadata.tables)
+    assert {"feeds","fetch_runs","articles","events","event_articles","event_cluster_candidates","reviews","event_revisions","ai_runs","jobs","users","sessions","audit_logs"} == set(Base.metadata.tables)
 
 def test_initial_migration_downgrade_cleans_every_named_enum():
     from pathlib import Path
-    migration=next((Path(__file__).parents[2]/"migrations"/"versions").glob("*_initial_schema_phase1.py")).read_text()
+    migrations=[path.read_text() for path in (Path(__file__).parents[2]/"migrations"/"versions").glob("*.py")]
+    downgrade_text="\n".join(migration.split("def downgrade",1)[1] for migration in migrations if "def downgrade" in migration)
     enum_names={column.type.name for table in Base.metadata.tables.values() for column in table.columns if isinstance(column.type,Enum)}
     assert enum_names
     for enum_name in enum_names:
-        assert f"'{enum_name}'" in migration.split("def downgrade()",1)[1]
+        assert enum_name in downgrade_text

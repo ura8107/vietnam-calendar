@@ -1,11 +1,12 @@
 # Phase 3 verification
 
-Date: 2026-07-17. All provider tests were offline through `httpx.MockTransport`; no OpenAI or Ollama request was sent.
+Date: 2026-07-18. Automated provider tests are offline through `httpx.MockTransport`; no OpenAI request was sent. A separately authorized local Ollama capability test is recorded below.
 
 ## Delivered
 
 - `importance-rubric-v1` deterministic relevance/importance/must-include baseline and versioned prompt/rubric assets.
 - Strict shared Pydantic contract for OpenAI Responses and Ollama `/api/chat` structured output.
+- Deterministic, non-mutating Ollama Schema compatibility conversion removes only grammar-unsupported annotations/bounds while retaining structural constraints. The complete shared Pydantic contract is always applied after generation.
 - OpenAI `store=false`, bounded timeout, refusal/incomplete/schema/error classification, and no stateful response chaining.
 - Provider selection defaults to disabled. `AI_AUTO_FALLBACK=false`; adapters never select or fall back to another provider.
 - Article analysis durable job routing and `ai_runs` records with source IDs, hashes, versions, status/timestamps, latency, provider request ID and token counts when returned.
@@ -20,7 +21,11 @@ Command:
 
 `UV_CACHE_DIR=/private/tmp/vietnam-calendar-uv-cache uv run pytest -q`
 
-Result after the independent-audit hardening passes: **96 passed, 4 skipped**. The skips require an explicit PostgreSQL test database. The Phase 3 integration test is enabled with `PHASE3_TEST_DATABASE_URL`; it creates and cleans up its own uniquely identified Feed, Article, Job and AI runs, so it has no test-order or pre-existing-row dependency. It verifies durable success, `job_id`/`attempt_number` correlation, retry semantics, and preservation of a recent concurrent `started` run. Offline unit tests also cover both completion-race branches of durable enqueue deduplication.
+Result after the Ollama compatibility pass and schema-map regression hardening: **99 passed, 4 skipped**. The skips require an explicit PostgreSQL test database. The Phase 3 integration test is enabled with `PHASE3_TEST_DATABASE_URL`; it creates and cleans up its own uniquely identified Feed, Article, Job and AI runs, so it has no test-order or pre-existing-row dependency. It verifies durable success, `job_id`/`attempt_number` correlation, retry semantics, and preservation of a recent concurrent `started` run. Offline unit tests also verify that fields and definitions literally named like unsupported Schema keywords remain intact during conversion, plus both completion-race branches of durable enqueue deduplication.
+
+## Local Ollama capability verification
+
+On 2026-07-18, the production `OllamaProvider` path was exercised against the already-installed `qwen3.6:latest` model (23 GB) on `127.0.0.1:11434`. After aligning the prompt's target/out-of-scope/uncertain stage rules with the Pydantic contract and giving the capability fixture an explicit event/publication date, the same request passed **3 of 3** consecutive runs. Each run returned a target event dated 2026-07-17 with high importance and one valid evidence reference, and passed the full `EventAnalysisResult` validation. No model was downloaded and no OpenAI credential or endpoint was accessed. This demonstrates repeatable contract capability for the fixed fixture, not representative classification quality; the 57-case corpus should be run separately before relying on this or any newly selected local model.
 
 Rule baseline (`evals/importance-v1.jsonl`, SHA-256 `0dc949488ce98698f77e5b8f2ba6c99652aa64517c5645db7efd775a65da86c6`):
 

@@ -17,6 +17,7 @@ from .infrastructure.feeds.rss import FeedError
 from .jobs import claim, fail, heartbeat, recover_expired_leases, succeed
 from .models import AIRun,AIRunStatus,EventArticle,Feed,JobStatus,JobType
 from .application.evals import evaluate_rules
+from .events import generate_cluster_candidates
 from sqlalchemy import select
 from datetime import UTC,datetime
 from pathlib import Path
@@ -89,6 +90,8 @@ async def run() -> None:
                     article_id=(await session.scalars(select(EventArticle.article_id).where(EventArticle.event_id==uuid.UUID(str(job.payload["event_id"]))).order_by(EventArticle.is_primary_source.desc()).limit(1))).one_or_none()
                 if article_id is None: raise RuntimeError("event has no source article")
                 work=analyze_article(SessionFactory,settings,article_id,job_id=job.id,retry_count=max(0,job.attempts-1))
+            elif job.job_type == JobType.cluster_event:
+                work=generate_cluster_candidates(SessionFactory,uuid.UUID(str(job.payload["event_id"])))
             elif job.job_type == JobType.retention and job.payload.get("kind")=="importance_eval":
                 async def run_eval():
                     now=datetime.now(UTC)

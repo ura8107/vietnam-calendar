@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 from pydantic import ValidationError
 
-from vietnam_calendar.application.ai import EventAnalysisRequest, EventAnalysisResult, ProviderHealth, event_analysis_json_schema, normalize_analysis_result
+from vietnam_calendar.application.ai import EventAnalysisRequest, EventAnalysisResult, ProviderHealth, event_analysis_json_schema, normalize_analysis_result, ollama_event_analysis_json_schema
 from vietnam_calendar.application.assets import load_ai_assets
 
 
@@ -80,7 +80,7 @@ class OllamaProvider:
     last_metadata: dict[str, Any] | None = None
     async def analyze_event(self,request:EventAnalysisRequest)->EventAnalysisResult:
         if not self.enabled: raise AIProviderError("provider_disabled","Ollama provider is disabled")
-        try: response=await self.client.post("/api/chat",json={"model":self.model,"stream":False,"messages":[{"role":"system","content":_instructions()},{"role":"user","content":_prompt(request)}],"format":event_analysis_json_schema(),"options":{"temperature":0}})
+        try: response=await self.client.post("/api/chat",json={"model":self.model,"stream":False,"messages":[{"role":"system","content":_instructions()},{"role":"user","content":_prompt(request)}],"format":ollama_event_analysis_json_schema(),"options":{"temperature":0}})
         except httpx.TimeoutException as exc: raise AIProviderError("timeout","AI provider timed out",retryable=True) from exc
         except httpx.RequestError as exc: raise AIProviderError("transport_error","AI provider transport failed",retryable=True) from exc
         _raise_http(response)

@@ -15,6 +15,7 @@ from vietnam_calendar.application.ai import (
     EventAnalysisResult,
     event_analysis_json_schema,
     normalize_analysis_result,
+    ollama_event_analysis_json_schema,
 )
 
 
@@ -58,7 +59,7 @@ async def ollama_chat_spike(
             "model": model,
             "stream": False,
             "messages": [{"role": "user", "content": request.model_dump_json()}],
-            "format": event_analysis_json_schema(),
+            "format": ollama_event_analysis_json_schema(),
         },
     )
     response.raise_for_status()

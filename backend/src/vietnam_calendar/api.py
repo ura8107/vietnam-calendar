@@ -4,7 +4,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 
 from alembic.config import Config
@@ -19,7 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import Settings, get_settings
 from .db import engine, get_session
 from .jobs import enqueue
-from .models import AIRun, AIRunStatus, AuditLog, Feed, FetchRun, Job, JobStatus, JobType, Session, User
+from .models import (AIRun, AIRunStatus, Article, AuditLog, Certainty, ClusterCandidateStatus, DateCertainty,
+                     Event, EventArticle, EventClusterCandidate, EventRevision, Feed,
+                     FetchRun, Importance, Job, JobStatus, JobType, PublicationStatus,
+                     Relevance, Review, ReviewDecision, Session, User)
+from .events import merge_events, revise_event, review_event, snapshot, split_event
 from .analysis import build_provider
 from .application.ai import ArticleInput,EventAnalysisRequest
 from .application.evals import evaluate_rules
@@ -34,6 +38,17 @@ class LoginOutput(BaseModel): csrf_token: str
 class MeOutput(BaseModel): id: str; username: str; is_admin: bool
 class FeedOutput(BaseModel): id: str; name: str; url: str; publisher: str; enabled: bool; fetch_interval_minutes: int
 class JobAccepted(BaseModel): job_id: str; created: bool
+class EventPatch(BaseModel):
+    version:int=Field(ge=1); reason:str=Field(min_length=1,max_length=1000)
+    title_ja:str|None=Field(default=None,min_length=1,max_length=500); summary_ja:str|None=Field(default=None,min_length=1,max_length=10000); event_date:date|None=None
+    date_certainty:DateCertainty|None=None; category:str|None=Field(default=None,min_length=1,max_length=60); relevance_status:Relevance|None=None; relevance_reason:str|None=Field(default=None,max_length=4000)
+    importance_level:Importance|None=None; importance_score:int|None=Field(default=None,ge=0,le=100); importance_reason:str|None=Field(default=None,max_length=4000); must_include:bool|None=None; must_include_reason:str|None=Field(default=None,max_length=4000); certainty:Certainty|None=None
+class ReviewInput(BaseModel): version:int=Field(ge=1); decision:ReviewDecision; reason:str|None=Field(default=None,max_length=4000); uncertainty_note:str|None=Field(default=None,max_length=4000)
+class MergeInput(BaseModel): source_event_id:uuid.UUID; target_version:int=Field(ge=1); source_version:int=Field(ge=1); reason:str=Field(min_length=1,max_length=4000)
+class SplitEventValues(BaseModel):
+    title_ja:str=Field(min_length=1,max_length=500); summary_ja:str=Field(min_length=1,max_length=10000); event_date:date; date_certainty:DateCertainty; category:str=Field(min_length=1,max_length=60); relevance_status:Relevance; relevance_reason:str|None=None; importance_level:Importance|None=None; importance_score:int|None=Field(default=None,ge=0,le=100); importance_reason:str|None=None; must_include:bool=False; must_include_reason:str|None=None; certainty:Certainty
+class SplitInput(BaseModel): version:int=Field(ge=1); article_ids:list[uuid.UUID]=Field(min_length=1); event:SplitEventValues; reason:str=Field(min_length=1,max_length=4000)
+class CandidateReviewInput(BaseModel): status:ClusterCandidateStatus; reason:str=Field(min_length=1,max_length=4000)
 
 class LoginLimiter:
     def __init__(self, limit:int=5, window:int=60, max_keys:int=4096): self.limit=limit; self.window=window; self.max_keys=max_keys; self.attempts: OrderedDict[str,deque[float]]=OrderedDict()
@@ -187,7 +202,7 @@ async def test_ai_provider(name:str,request:Request,db:DB,admin:Admin,settings:A
     session,user=admin; require_csrf(session,x_csrf_token)
     if name!=settings.ai_provider: raise HTTPException(409,"provider is not selected")
     provider=build_provider(settings)
-    fixed=EventAnalysisRequest(articles=[ArticleInput(article_id=uuid.UUID("11111111-1111-4111-8111-111111111111"),title="Vietnam central bank formally changes policy rate",summary="Confirmed formal decision.",publisher="Capability fixture")])
+    fixed=EventAnalysisRequest(articles=[ArticleInput(article_id=uuid.UUID("11111111-1111-4111-8111-111111111111"),title="Vietnam central bank formally changed the policy rate on July 17, 2026",summary="The central bank confirmed and enacted the formal policy-rate decision on July 17, 2026.",publisher="Capability fixture",published_at=datetime(2026,7,17,0,0,tzinfo=UTC))])
     try:
         result=await provider.analyze_event(fixed)
     except AIProviderError as exc:
@@ -224,3 +239,78 @@ async def reanalyze_event(event_id:uuid.UUID,request:Request,db:DB,admin:Admin,x
     job_id,created=await enqueue_or_active(db,JobType.reanalyze_event,{"event_id":str(event_id)},f"event:{event_id}:reanalyze",max_attempts=2)
     db.add(AuditLog(actor_user_id=user.id,action="event.reanalyze_requested",entity_type="event",entity_id=str(event_id),request_id=request_id(request),before_values=None,after_values={"job_id":str(job_id)},details={})); await db.commit()
     return JobAccepted(job_id=str(job_id),created=created)
+
+def event_output(event:Event)->dict[str,Any]:
+    return {"id":str(event.id),**snapshot(event),"current_revision_id":str(event.current_revision_id) if event.current_revision_id else None,"rule_version":event.rule_version,"prompt_version":event.prompt_version}
+
+@app.get("/api/v1/events")
+async def list_events(db:DB,admin:Admin,status:PublicationStatus|None=None,limit:int=50):
+    query=select(Event).order_by(Event.event_date.desc(),Event.updated_at.desc()).limit(max(1,min(limit,200)))
+    if status is not None: query=query.where(Event.publication_status==status)
+    return [event_output(e) for e in (await db.scalars(query)).all()]
+
+@app.get("/api/v1/events/{event_id}")
+async def get_event(event_id:uuid.UUID,db:DB,admin:Admin):
+    event=await db.get(Event,event_id)
+    if event is None: raise HTTPException(404,"event not found")
+    links=(await db.execute(select(EventArticle,Article).join(Article,Article.id==EventArticle.article_id).where(EventArticle.event_id==event_id))).all()
+    revisions=(await db.scalars(select(EventRevision).where(EventRevision.event_id==event_id).order_by(EventRevision.version.desc()).limit(50))).all()
+    result=event_output(event); result["articles"]=[{"id":str(a.id),"title":a.title_raw,"url":a.source_url,"published_at":a.published_at,"is_primary_source":link.is_primary_source,"link_reason":link.link_reason} for link,a in links]; result["revisions"]=[{"id":str(r.id),"version":r.version,"reason":r.reason,"created_at":r.created_at} for r in revisions]
+    return result
+
+@app.patch("/api/v1/events/{event_id}")
+async def patch_event(event_id:uuid.UUID,body:EventPatch,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token); event=(await db.scalars(select(Event).where(Event.id==event_id).with_for_update())).one_or_none()
+    if event is None: raise HTTPException(404,"event not found")
+    values=body.model_dump(exclude={"version","reason"},exclude_unset=True)
+    if not values: raise HTTPException(422,"at least one event field is required")
+    await revise_event(db,event,user,values,body.version,body.reason,request_id(request)); await db.commit(); return event_output(event)
+
+@app.post("/api/v1/events/{event_id}/review")
+async def post_event_review(event_id:uuid.UUID,body:ReviewInput,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token); event=(await db.scalars(select(Event).where(Event.id==event_id).with_for_update())).one_or_none()
+    if event is None: raise HTTPException(404,"event not found")
+    review=await review_event(db,event,user,body.decision,body.version,body.reason,body.uncertainty_note,request_id(request)); await db.commit()
+    return {"review_id":str(review.id),"event":event_output(event)}
+
+@app.post("/api/v1/events/{event_id}/merge")
+async def post_event_merge(event_id:uuid.UUID,body:MergeInput,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token)
+    ids=sorted((event_id,body.source_event_id),key=str); locked=(await db.scalars(select(Event).where(Event.id.in_(ids)).order_by(Event.id).with_for_update())).all(); by_id={e.id:e for e in locked}
+    if event_id not in by_id or body.source_event_id not in by_id: raise HTTPException(404,"event not found")
+    target=await merge_events(db,by_id[event_id],by_id[body.source_event_id],user,body.target_version,body.source_version,body.reason,request_id(request)); await db.commit(); return event_output(target)
+
+@app.post("/api/v1/events/{event_id}/split",status_code=201)
+async def post_event_split(event_id:uuid.UUID,body:SplitInput,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token); source=(await db.scalars(select(Event).where(Event.id==event_id).with_for_update())).one_or_none()
+    if source is None: raise HTTPException(404,"event not found")
+    new_event=await split_event(db,source,user,body.article_ids,body.version,body.event.model_dump(),body.reason,request_id(request)); await db.commit(); return event_output(new_event)
+
+@app.get("/api/v1/events/{event_id}/cluster-candidates")
+async def cluster_candidates(event_id:uuid.UUID,db:DB,admin:Admin):
+    if await db.get(Event,event_id) is None: raise HTTPException(404,"event not found")
+    rows=(await db.scalars(select(EventClusterCandidate).where((EventClusterCandidate.event_id==event_id)|(EventClusterCandidate.candidate_event_id==event_id)).order_by(EventClusterCandidate.similarity_score.desc()))).all()
+    return [{"id":str(c.id),"event_id":str(c.event_id),"candidate_event_id":str(c.candidate_event_id),"similarity_score":float(c.similarity_score),"reasons":c.reasons,"status":c.status.value} for c in rows]
+
+@app.patch("/api/v1/events/{event_id}/cluster-candidates/{candidate_id}")
+async def review_cluster_candidate(event_id:uuid.UUID,candidate_id:uuid.UUID,body:CandidateReviewInput,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token)
+    if body.status==ClusterCandidateStatus.pending: raise HTTPException(422,"candidate must be accepted or dismissed")
+    candidate=(await db.scalars(select(EventClusterCandidate).where(EventClusterCandidate.id==candidate_id,((EventClusterCandidate.event_id==event_id)|(EventClusterCandidate.candidate_event_id==event_id))).with_for_update())).one_or_none()
+    if candidate is None: raise HTTPException(404,"cluster candidate not found")
+    if candidate.status!=ClusterCandidateStatus.pending: raise HTTPException(409,"cluster candidate was already reviewed")
+    participants=(await db.scalars(select(Event).where(Event.id.in_([candidate.event_id,candidate.candidate_event_id])))).all()
+    if len(participants)!=2 or any(event.publication_status==PublicationStatus.hidden or event.merged_into_event_id is not None for event in participants):
+        candidate.status=ClusterCandidateStatus.dismissed; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
+        db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_invalidated",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id(request),before_values={"status":"pending"},after_values={"status":"dismissed"},details={"reason":"event unavailable"})); await db.commit()
+        return {"id":str(candidate.id),"status":"dismissed","invalidated":True}
+    before={"status":candidate.status.value}; candidate.status=body.status; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
+    db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_reviewed",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id(request),before_values=before,after_values={"status":body.status.value},details={"reason":body.reason})); await db.commit()
+    return {"id":str(candidate.id),"status":candidate.status.value}
+
+@app.post("/api/v1/events/{event_id}/cluster",response_model=JobAccepted,status_code=202)
+async def request_cluster(event_id:uuid.UUID,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token)
+    if await db.get(Event,event_id) is None: raise HTTPException(404,"event not found")
+    job_id,created=await enqueue_or_active(db,JobType.cluster_event,{"event_id":str(event_id)},f"event:{event_id}:cluster",max_attempts=2)
+    db.add(AuditLog(actor_user_id=user.id,action="event.cluster_requested",entity_type="event",entity_id=str(event_id),request_id=request_id(request),before_values=None,after_values={"job_id":str(job_id)},details={})); await db.commit(); return JobAccepted(job_id=str(job_id),created=created)

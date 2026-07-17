@@ -6,6 +6,7 @@ pass it through :func:`normalize_analysis_result` before returning it.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Any, Mapping, Protocol, runtime_checkable
@@ -218,3 +219,88 @@ def event_analysis_json_schema() -> dict[str, Any]:
     """Return the single JSON Schema used by all structured-output adapters."""
 
     return EventAnalysisResult.model_json_schema()
+
+
+# Ollama's grammar compiler supports the structural subset of JSON Schema used
+# here, but some versions/models reject Pydantic's annotations and boundary
+# constraints.  These constraints remain authoritative in EventAnalysisResult
+# and are therefore always enforced after generation by
+# normalize_analysis_result().
+_OLLAMA_UNSUPPORTED_SCHEMA_KEYWORDS = frozenset(
+    {
+        "title",
+        "format",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minimum",
+        "maximum",
+    }
+)
+
+_JSON_SCHEMA_MAP_KEYWORDS = frozenset(
+    {"$defs", "definitions", "properties", "patternProperties", "dependentSchemas"}
+)
+_JSON_SCHEMA_SINGLE_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_JSON_SCHEMA_SCHEMA_ARRAY_KEYWORDS = frozenset(
+    {"allOf", "anyOf", "oneOf", "prefixItems"}
+)
+
+
+def ollama_compatible_json_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy a JSON Schema while removing unsupported schema-node keywords.
+
+    Keys below ``properties``, ``$defs`` and other named-schema maps are user
+    names, not JSON Schema keywords. They must be retained even when a field or
+    definition is literally named ``title`` or ``format``.
+    """
+
+    def compatible_schema(node: Mapping[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in _OLLAMA_UNSUPPORTED_SCHEMA_KEYWORDS:
+                continue
+            if key in _JSON_SCHEMA_MAP_KEYWORDS and isinstance(value, Mapping):
+                result[key] = {
+                    name: compatible_schema(child) if isinstance(child, Mapping) else deepcopy(child)
+                    for name, child in value.items()
+                }
+            elif key in _JSON_SCHEMA_SINGLE_SCHEMA_KEYWORDS and isinstance(value, Mapping):
+                result[key] = compatible_schema(value)
+            elif key in _JSON_SCHEMA_SCHEMA_ARRAY_KEYWORDS and isinstance(value, list):
+                result[key] = [
+                    compatible_schema(child) if isinstance(child, Mapping) else deepcopy(child)
+                    for child in value
+                ]
+            else:
+                result[key] = deepcopy(value)
+        return result
+
+    return compatible_schema(schema)
+
+
+def ollama_event_analysis_json_schema() -> dict[str, Any]:
+    """Return a grammar-compatible copy of the strict analysis schema.
+
+    The source Pydantic schema is never mutated. Structural constraints such as
+    types, enums, required fields and ``additionalProperties`` are retained;
+    only keywords known to be rejected by the Ollama grammar compiler are
+    removed. Provider output must still pass the full Pydantic contract.
+    """
+
+    return ollama_compatible_json_schema(event_analysis_json_schema())

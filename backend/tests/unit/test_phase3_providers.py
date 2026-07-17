@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 from uuid import UUID
 import httpx,pytest
-from vietnam_calendar.application.ai import ArticleInput,EventAnalysisRequest
+from vietnam_calendar.application.ai import ArticleInput,EventAnalysisRequest,event_analysis_json_schema,ollama_compatible_json_schema,ollama_event_analysis_json_schema
 from vietnam_calendar.infrastructure.ai.providers import AIProviderError,OpenAIProvider,OllamaProvider
 from vietnam_calendar.analysis import build_provider
 from vietnam_calendar.config import Settings
@@ -13,7 +13,7 @@ def req(): return EventAnalysisRequest(articles=[ArticleInput(article_id=ID,titl
 def output(): return json.dumps({"relevance":"target","relevance_reason":"Vietnam","event_title_ja":"政策金利変更","summary_ja":"中央銀行が政策金利を変更した。","event_date":"2026-07-17","date_certainty":"confirmed","category":"economy","certainty":"confirmed","importance_level":"high","must_include_candidate":True,"importance_reason":"中核決定","evidence":[{"source_article_id":str(ID),"rationale":"title"}],"confidence":0.9,"same_event_candidate_ids":[]})
 
 @pytest.mark.asyncio
-async def test_openai_store_false_and_ollama_exact_schema():
+async def test_openai_keeps_strict_schema_and_ollama_uses_compatible_schema():
     seen={}
     def handler(r):
         seen[r.url.path]=json.loads(r.content)
@@ -23,7 +23,70 @@ async def test_openai_store_false_and_ollama_exact_schema():
     async with httpx.AsyncClient(base_url="https://offline",transport=t) as c: assert (await OpenAIProvider(c,"model",True).analyze_event(req())).must_include_candidate
     async with httpx.AsyncClient(base_url="http://offline",transport=t) as c: assert (await OllamaProvider(c,"model",True).analyze_event(req())).must_include_candidate
     assert seen["/v1/responses"]["store"] is False
-    assert seen["/api/chat"]["format"]["additionalProperties"] is False
+    strict=seen["/v1/responses"]["text"]["format"]["schema"]
+    compatible=seen["/api/chat"]["format"]
+    assert strict["properties"]["confidence"]["maximum"] == 1
+    assert compatible["additionalProperties"] is False
+    assert compatible["required"] == strict["required"]
+    assert compatible["properties"]["relevance"] == strict["properties"]["relevance"]
+    assert "maximum" not in compatible["properties"]["confidence"]
+
+def test_ollama_schema_conversion_is_recursive_deterministic_and_non_mutating():
+    strict=event_analysis_json_schema()
+    snapshot=json.loads(json.dumps(strict))
+    first=ollama_event_analysis_json_schema()
+    second=ollama_event_analysis_json_schema()
+
+    assert strict == snapshot
+    assert first == second
+    assert first is not strict
+    assert first["additionalProperties"] is False
+    assert first["$defs"]["Evidence"]["additionalProperties"] is False
+    assert first["$defs"]["ImportanceLevel"]["enum"] == ["low","middle","middle_high","high"]
+    assert first["properties"]["event_title_ja"]["anyOf"][1] == {"type":"null"}
+
+    forbidden={"title","format","minLength","maxLength","minItems","maxItems","minimum","maximum"}
+    def keys(value):
+        if isinstance(value,dict):
+            return set(value).union(*(keys(item) for item in value.values()))
+        if isinstance(value,list): return set().union(*(keys(item) for item in value))
+        return set()
+    assert not (keys(first) & forbidden)
+
+def test_ollama_schema_conversion_preserves_names_matching_schema_keywords():
+    artificial={
+        "title":"root annotation",
+        "type":"object",
+        "properties":{
+            "title":{"title":"field annotation","type":"string","maxLength":10},
+            "format":{"format":"uuid","type":"string"},
+        },
+        "$defs":{
+            "title":{"title":"definition annotation","type":"number","minimum":0},
+            "format":{"type":"string","format":"date"},
+        },
+    }
+    snapshot=json.loads(json.dumps(artificial))
+
+    compatible=ollama_compatible_json_schema(artificial)
+
+    assert artificial == snapshot
+    assert set(compatible["properties"]) == {"title","format"}
+    assert compatible["properties"]["title"] == {"type":"string"}
+    assert compatible["properties"]["format"] == {"type":"string"}
+    assert set(compatible["$defs"]) == {"title","format"}
+    assert compatible["$defs"]["title"] == {"type":"number"}
+    assert compatible["$defs"]["format"] == {"type":"string"}
+
+@pytest.mark.asyncio
+async def test_ollama_compatible_generation_still_uses_full_pydantic_validation():
+    invalid=json.loads(output())
+    invalid["confidence"]=1.1
+    invalid["summary_ja"]=""
+    body={"done":True,"message":{"content":json.dumps(invalid)}}
+    async with httpx.AsyncClient(base_url="http://offline",transport=httpx.MockTransport(lambda r:httpx.Response(200,json=body))) as c:
+        with pytest.raises(AIProviderError) as e: await OllamaProvider(c,"m",True).analyze_event(req())
+    assert e.value.code=="schema_invalid"
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider",["openai","ollama"])
@@ -61,6 +124,9 @@ def test_provider_selection_has_no_hidden_fallback():
 
 def test_assets_are_versioned_cached_and_identical_for_both_adapters():
     rubric,prompt,digest=load_ai_assets(); assert "Importance rubric v1" in rubric and "untrusted" in prompt and len(digest)==64
+    assert 'relevance is "target"' in prompt
+    assert "event_date" in prompt and "importance_level" in prompt
+    assert "must all be non-null" in prompt and "published_fallback" in prompt
     assert load_ai_assets() is load_ai_assets()
 
 def test_unknown_provider_and_openai_key_host_are_rejected():
