@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=(".env", ".env.local"), extra="ignore")
 
     app_env: str = "development"
     database_url: str = "postgresql+psycopg://app:change-me@db:5432/vietnam_calendar"
@@ -27,11 +27,25 @@ class Settings(BaseSettings):
     rss_max_raw_entry_bytes: int = Field(default=65536, ge=1024, le=1048576)
     worker_poll_seconds: float = Field(default=2.0, ge=0.1, le=60)
     worker_lease_seconds: int = Field(default=120, ge=30, le=3600)
+    ai_provider: str = "disabled"
+    ai_fallback_provider: str = "disabled"
+    ai_auto_fallback: bool = False
+    ai_timeout_seconds: float = Field(default=45, gt=0, le=180)
+    openai_api_key: str = Field(default="", repr=False)
+    openai_model: str = ""
+    openai_base_url: str = "https://api.openai.com"
+    openai_allow_unsafe_base_url: bool = False
+    ollama_model: str = ""
+    ollama_base_url: str = "http://ollama:11434"
 
     @model_validator(mode="after")
     def deadline_precedes_lease(self) -> "Settings":
         if self.rss_total_timeout >= self.worker_lease_seconds:
             raise ValueError("rss_total_timeout must be shorter than worker_lease_seconds")
+        from urllib.parse import urlsplit
+        u=urlsplit(self.openai_base_url)
+        if self.openai_api_key and not self.openai_allow_unsafe_base_url and (u.scheme!="https" or (u.hostname or "").lower()!="api.openai.com"):
+            raise ValueError("OPENAI_API_KEY may only be sent to https://api.openai.com; development override must be explicit")
         return self
 
     @property

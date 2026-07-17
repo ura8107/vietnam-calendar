@@ -9,11 +9,17 @@ import socket
 import uuid
 
 from .collection import FeedNotFound, collect_feed
+from .analysis import analyze_article
+from .infrastructure.ai.providers import AIProviderError
 from .config import get_settings
 from .db import SessionFactory, engine
 from .infrastructure.feeds.rss import FeedError
 from .jobs import claim, fail, heartbeat, recover_expired_leases, succeed
-from .models import Feed, JobStatus, JobType
+from .models import AIRun,AIRunStatus,EventArticle,Feed,JobStatus,JobType
+from .application.evals import evaluate_rules
+from sqlalchemy import select
+from datetime import UTC,datetime
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -74,9 +80,32 @@ async def run() -> None:
                 await session.commit()
             if job is None:
                 await asyncio.sleep(settings.worker_poll_seconds); continue
-            if job.job_type != JobType.fetch_feed: raise RuntimeError(f"unsupported job type: {job.job_type.value}")
-            await _with_heartbeat(collect_feed(SessionFactory, settings, uuid.UUID(str(job.payload["feed_id"])), job.id),
+            if job.job_type == JobType.fetch_feed:
+                work=collect_feed(SessionFactory, settings, uuid.UUID(str(job.payload["feed_id"])), job.id)
+            elif job.job_type == JobType.analyze_article:
+                work=analyze_article(SessionFactory,settings,uuid.UUID(str(job.payload["article_id"])),job_id=job.id,retry_count=max(0,job.attempts-1))
+            elif job.job_type == JobType.reanalyze_event:
+                async with SessionFactory() as session:
+                    article_id=(await session.scalars(select(EventArticle.article_id).where(EventArticle.event_id==uuid.UUID(str(job.payload["event_id"]))).order_by(EventArticle.is_primary_source.desc()).limit(1))).one_or_none()
+                if article_id is None: raise RuntimeError("event has no source article")
+                work=analyze_article(SessionFactory,settings,article_id,job_id=job.id,retry_count=max(0,job.attempts-1))
+            elif job.job_type == JobType.retention and job.payload.get("kind")=="importance_eval":
+                async def run_eval():
+                    now=datetime.now(UTC)
+                    try: report=evaluate_rules(Path(job.payload["path"]))
+                    except Exception as exc:
+                        async with SessionFactory() as session:
+                            session.add(AIRun(job_id=job.id,attempt_number=job.attempts,provider="rule",base_url_identifier="local",model="importance-rubric-v1",prompt_version="none",schema_version="importance-eval-report-v1",rule_version="importance-rubric-v1",input_hash="0"*64,source_article_ids=[],validation_errors=[{"code":"eval_failed","message":"evaluation failed"}],status=AIRunStatus.failed,retry_count=max(0,job.attempts-1),latency_ms=0,started_at=now,finished_at=datetime.now(UTC))); await session.commit()
+                        raise RuntimeError("importance evaluation failed") from exc
+                    async with SessionFactory() as session:
+                        session.add(AIRun(job_id=job.id,attempt_number=job.attempts,provider="rule",base_url_identifier="local",model="importance-rubric-v1",prompt_version="none",schema_version="importance-eval-report-v1",rule_version="importance-rubric-v1",input_hash=report["dataset_sha256"],source_article_ids=[],parsed_output=report,status=AIRunStatus.succeeded,retry_count=max(0,job.attempts-1),latency_ms=0,started_at=now,finished_at=datetime.now(UTC))); await session.commit()
+                work=run_eval()
+            else: raise RuntimeError(f"unsupported job type: {job.job_type.value}")
+            await _with_heartbeat(work,
                                   job.id, ownership, settings.worker_lease_seconds)
+        except AIProviderError as exc:
+            async with SessionFactory() as session:
+                await fail(session,job.id,ownership,code=exc.code,message=str(exc),retryable=exc.retryable,retry_after=exc.retry_after); await session.commit()
         except FeedError as exc:
             async with SessionFactory() as session:
                 state = await fail(session, job.id, ownership, code=exc.code, message=str(exc),

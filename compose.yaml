@@ -14,12 +14,22 @@ services:
       retries: 20
 
   migrate:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment: &backend-env
       DATABASE_URL: postgresql+psycopg://app:${POSTGRES_PASSWORD}@db:5432/vietnam_calendar
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?set ADMIN_PASSWORD_HASH}
       COOKIE_SECURE: "false"
+      AI_PROVIDER: ${AI_PROVIDER:-disabled}
+      AI_FALLBACK_PROVIDER: ${AI_FALLBACK_PROVIDER:-disabled}
+      AI_AUTO_FALLBACK: ${AI_AUTO_FALLBACK:-false}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-45}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
     depends_on:
       db:
         condition: service_healthy
@@ -27,8 +37,12 @@ services:
     restart: "no"
 
   api:
-    build: ./backend
-    environment: *backend-env
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      <<: *backend-env
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -41,7 +55,9 @@ services:
       retries: 10
 
   scheduler:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment: *backend-env
     depends_on:
       migrate:
@@ -50,13 +66,25 @@ services:
     restart: unless-stopped
 
   worker:
-    build: ./backend
-    environment: *backend-env
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      <<: *backend-env
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     depends_on:
       migrate:
         condition: service_completed_successfully
     command: ["python", "-m", "vietnam_calendar.worker"]
     restart: unless-stopped
 
+  ollama:
+    image: ollama/ollama:0.13.5
+    profiles: ["ollama"]
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
 volumes:
   postgres-data:
+  ollama-data:

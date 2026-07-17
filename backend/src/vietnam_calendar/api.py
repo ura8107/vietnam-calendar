@@ -19,7 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import Settings, get_settings
 from .db import engine, get_session
 from .jobs import enqueue
-from .models import AuditLog, Feed, FetchRun, Job, JobStatus, JobType, Session, User
+from .models import AIRun, AIRunStatus, AuditLog, Feed, FetchRun, Job, JobStatus, JobType, Session, User
+from .analysis import build_provider
+from .application.ai import ArticleInput,EventAnalysisRequest
+from .application.evals import evaluate_rules
+from .infrastructure.ai.providers import AIProviderError
 from .security import random_token, token_hash, verify_password
 
 DUMMY_ARGON2_HASH = "$argon2id$v=19$m=65536,t=3,p=4$7NPVOF0sfNLwDLGW8SvqzQ$9hxBQrk5NIizcQRb7GFouaNQSnzQNwWct4gDQT6izgM"
@@ -129,6 +133,18 @@ async def list_feeds(db:DB,admin:Admin):
 def require_csrf(session:Session,value:str|None)->None:
     if not value or not hmac.compare_digest(token_hash(value),session.csrf_token_hash): raise HTTPException(403,"invalid CSRF token")
 
+async def enqueue_or_active(db:AsyncSession,job_type:JobType,payload:dict[str,Any],dedupe_key:str,*,max_attempts:int=3)->tuple[uuid.UUID,bool]:
+    job_id=await enqueue(db,job_type,payload,dedupe_key=dedupe_key,max_attempts=max_attempts)
+    if job_id is not None: return job_id,True
+    query=select(Job.id).where(Job.job_type==job_type,Job.dedupe_key==dedupe_key,Job.status.in_([JobStatus.queued,JobStatus.running,JobStatus.retry_wait]))
+    job_id=(await db.scalars(query)).one_or_none()
+    if job_id is None:
+        job_id=await enqueue(db,job_type,payload,dedupe_key=dedupe_key,max_attempts=max_attempts)
+        if job_id is not None: return job_id,True
+        job_id=(await db.scalars(query)).one_or_none()
+    if job_id is None: raise HTTPException(409,"job state changed; retry request")
+    return job_id,False
+
 @app.post("/api/v1/feeds/{feed_id}/fetch",response_model=JobAccepted,status_code=202)
 async def fetch_feed(feed_id:uuid.UUID,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
     session,user=admin; require_csrf(session,x_csrf_token)
@@ -158,3 +174,53 @@ async def list_jobs(db:DB,admin:Admin,limit:int=50):
 async def list_fetch_runs(db:DB,admin:Admin,limit:int=50):
     limit=max(1,min(limit,200)); rows=(await db.scalars(select(FetchRun).order_by(FetchRun.started_at.desc()).limit(limit))).all()
     return [{"id":str(r.id),"feed_id":str(r.feed_id),"job_id":str(r.job_id) if r.job_id else None,"status":r.status.value,"http_status":r.http_status,"fetched_count":r.fetched_count,"inserted_count":r.inserted_count,"updated_count":r.updated_count,"rejected_count":r.rejected_count,"error_code":r.error_code,"started_at":r.started_at,"finished_at":r.finished_at} for r in rows]
+
+@app.get("/api/v1/ai/providers")
+async def ai_providers(admin:Admin,settings:Annotated[Settings,Depends(get_settings)]):
+    provider=build_provider(settings)
+    try: health=await provider.health()
+    finally: await provider.client.aclose()
+    return {"selected":settings.ai_provider,"fallback":settings.ai_fallback_provider,"auto_fallback":settings.ai_auto_fallback,"providers":[health.model_dump()]}
+
+@app.post("/api/v1/ai/providers/{name}/test")
+async def test_ai_provider(name:str,request:Request,db:DB,admin:Admin,settings:Annotated[Settings,Depends(get_settings)],x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token)
+    if name!=settings.ai_provider: raise HTTPException(409,"provider is not selected")
+    provider=build_provider(settings)
+    fixed=EventAnalysisRequest(articles=[ArticleInput(article_id=uuid.UUID("11111111-1111-4111-8111-111111111111"),title="Vietnam central bank formally changes policy rate",summary="Confirmed formal decision.",publisher="Capability fixture")])
+    try:
+        result=await provider.analyze_event(fixed)
+    except AIProviderError as exc:
+        db.add(AuditLog(actor_user_id=user.id,action="ai.provider_test_failed",entity_type="ai_provider",entity_id=name,request_id=request_id(request),before_values=None,after_values={"schema_valid":False,"error_code":exc.code},details={})); await db.commit()
+        raise HTTPException(503,f"provider capability test failed: {exc.code}") from exc
+    finally: await provider.client.aclose()
+    db.add(AuditLog(actor_user_id=user.id,action="ai.provider_test",entity_type="ai_provider",entity_id=name,request_id=request_id(request),before_values=None,after_values={"schema_valid":True},details={}))
+    await db.commit(); return {"provider":name,"schema_valid":True,"relevance":result.relevance.value}
+
+@app.get("/api/v1/evals/importance")
+async def importance_eval_summary(db:DB,admin:Admin):
+    from pathlib import Path
+    latest=(await db.scalars(select(AIRun).where(AIRun.provider=="rule",AIRun.schema_version=="importance-eval-report-v1",AIRun.status==AIRunStatus.succeeded).order_by(AIRun.finished_at.desc()).limit(1))).one_or_none()
+    if latest and latest.parsed_output: return latest.parsed_output
+    root=Path(__file__).resolve().parents[3]
+    path=(root/"evals"/"importance-v1.jsonl") if (root/"evals").exists() else Path("/app/evals/importance-v1.jsonl")
+    return evaluate_rules(path)
+
+@app.post("/api/v1/evals/importance/run")
+async def run_importance_eval(request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    from pathlib import Path
+    session,user=admin; require_csrf(session,x_csrf_token)
+    root=Path(__file__).resolve().parents[3]
+    path=(root/"evals"/"importance-v1.jsonl") if (root/"evals").exists() else Path("/app/evals/importance-v1.jsonl")
+    job_id,created=await enqueue_or_active(db,JobType.retention,{"kind":"importance_eval","path":str(path)},"eval:importance-rubric-v1",max_attempts=2)
+    db.add(AuditLog(actor_user_id=user.id,action="eval.importance_run",entity_type="eval",entity_id=str(job_id),request_id=request_id(request),before_values=None,after_values={"job_id":str(job_id)},details={}))
+    await db.commit(); return JSONResponse(status_code=202,content={"job_id":str(job_id),"created":created})
+
+@app.post("/api/v1/events/{event_id}/reanalyze",response_model=JobAccepted,status_code=202)
+async def reanalyze_event(event_id:uuid.UUID,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    from .models import Event
+    session,user=admin; require_csrf(session,x_csrf_token)
+    if await db.get(Event,event_id) is None: raise HTTPException(404,"event not found")
+    job_id,created=await enqueue_or_active(db,JobType.reanalyze_event,{"event_id":str(event_id)},f"event:{event_id}:reanalyze",max_attempts=2)
+    db.add(AuditLog(actor_user_id=user.id,action="event.reanalyze_requested",entity_type="event",entity_id=str(event_id),request_id=request_id(request),before_values=None,after_values={"job_id":str(job_id)},details={})); await db.commit()
+    return JobAccepted(job_id=str(job_id),created=created)
