@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Tuoi Tre News - Home</title>
+    <link>https://news.tuoitre.vn/</link>
+    <description>Minimal synthetic contract fixture for Tuoi Tre field mapping.</description>
+    <language>vi-vn</language>
+    <ttl>20</ttl>
+    <item>
+      <title>Sample Vietnam infrastructure decision</title>
+      <description>A short synthetic summary used only for parser tests.</description>
+      <link>https://news.tuoitre.vn/sample-article.htm</link>
+      <author>Tuoi Tre News</author>
+      <pubDate>Wed, 16 Jul 2025 09:30:00 GMT+7</pubDate>
+      <enclosure url="https://cdn.tuoitre.vn/sample-image.jpg" type="image/jpeg" />
+    </item>
+  </channel>
+</rss>

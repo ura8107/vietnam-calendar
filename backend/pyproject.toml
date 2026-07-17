@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vietnam-calendar"
+version = "0.1.0"
+description = "Local RSS journal calendar backend"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "alembic==1.17.2",
+  "apscheduler==3.11.1",
+  "argon2-cffi==25.1.0",
+  "fastapi==0.121.3",
+  "feedparser==6.0.12",
+  "greenlet==3.2.4",
+  "httpx==0.28.1",
+  "httpcore==1.0.9",
+  "pydantic==2.12.4",
+  "pydantic-settings==2.12.0",
+  "psycopg[binary]==3.2.12",
+  "sqlalchemy==2.0.44",
+  "uvicorn[standard]==0.38.0",
+]
+
+[dependency-groups]
+dev = [
+  "jsonschema==4.25.1",
+  "pytest==8.4.2",
+  "pytest-asyncio==1.2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vietnam_calendar"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+testpaths = ["tests"]

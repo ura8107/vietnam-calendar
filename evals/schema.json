@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Importance evaluation example",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "scenario", "expected_relevance", "expected_importance", "must_include", "reason", "tags"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^IMP-[0-9]{3}$"},
+    "scenario": {"type": "string", "minLength": 1},
+    "expected_relevance": {"enum": ["target", "out_of_scope", "uncertain"]},
+    "expected_importance": {"enum": ["low", "middle", "middle_high", "high", null]},
+    "must_include": {"type": "boolean"},
+    "reason": {"type": "string", "minLength": 1},
+    "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": true}
+  }
+}

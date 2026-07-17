@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:17.7-alpine
+    environment:
+      POSTGRES_DB: vietnam_calendar
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d vietnam_calendar"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: ./backend
+    environment: &backend-env
+      DATABASE_URL: postgresql+psycopg://app:${POSTGRES_PASSWORD}@db:5432/vietnam_calendar
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?set ADMIN_PASSWORD_HASH}
+      COOKIE_SECURE: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["sh", "-c", "alembic upgrade head && python -m vietnam_calendar.bootstrap"]
+    restart: "no"
+
+  api:
+    build: ./backend
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8080:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  scheduler:
+    build: ./backend
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["python", "-m", "vietnam_calendar.scheduler"]
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["python", "-m", "vietnam_calendar.worker"]
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
