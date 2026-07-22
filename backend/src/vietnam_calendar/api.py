@@ -1,11 +1,13 @@
 import hmac
 import ipaddress
+import re
 import time
 import uuid
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
+from urllib.parse import urlsplit,urlunsplit
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -13,7 +15,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text, update
+from sqlalchemy import case, func, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings, get_settings
@@ -23,7 +26,7 @@ from .models import (AIRun, AIRunStatus, Article, AuditLog, Certainty, ClusterCa
                      Event, EventArticle, EventClusterCandidate, EventRevision, Feed,
                      FetchRun, Importance, Job, JobStatus, JobType, PublicationStatus,
                      Relevance, Review, ReviewDecision, Session, User)
-from .events import merge_events, revise_event, review_event, snapshot, split_event
+from .events import decide_cluster_candidate, merge_events, revise_event, review_event, snapshot, split_event
 from .analysis import build_provider
 from .application.ai import ArticleInput,EventAnalysisRequest
 from .application.evals import evaluate_rules
@@ -35,9 +38,17 @@ DUMMY_ARGON2_HASH = "$argon2id$v=19$m=65536,t=3,p=4$7NPVOF0sfNLwDLGW8SvqzQ$9hxBQ
 class ErrorBody(BaseModel): code: str; message: str; request_id: str; details: Any = None
 class LoginInput(BaseModel): username: str=Field(min_length=1,max_length=100); password: str=Field(min_length=8,max_length=1024)
 class LoginOutput(BaseModel): csrf_token: str
-class MeOutput(BaseModel): id: str; username: str; is_admin: bool
-class FeedOutput(BaseModel): id: str; name: str; url: str; publisher: str; enabled: bool; fetch_interval_minutes: int
+class MeOutput(BaseModel): id: str; username: str; is_admin: bool; csrf_token: str
+class FeedOutput(BaseModel):
+    id: str; name: str; url: str; publisher: str; declared_language:str|None; default_category:str|None; enabled: bool; fetch_interval_minutes: int
+    trust_score:int|None; next_fetch_at: datetime; last_success_at: datetime|None; last_failure_at: datetime|None; consecutive_failures: int; updated_at: datetime; version:int
+class FeedCreate(BaseModel):
+    name:str=Field(min_length=1,max_length=200);url:str=Field(min_length=1,max_length=2000);publisher:str=Field(min_length=1,max_length=200);declared_language:str|None=Field(default=None,max_length=35);default_category:str|None=Field(default=None,max_length=60);trust_score:int|None=Field(default=None,ge=0,le=100);fetch_interval_minutes:int=Field(default=30,ge=5,le=1440);enabled:bool=True
+class FeedPatch(BaseModel):
+    version:int=Field(ge=1);enabled:bool|None=None;fetch_interval_minutes:int|None=Field(default=None,ge=5,le=1440);name:str|None=Field(default=None,min_length=1,max_length=200);url:str|None=Field(default=None,min_length=1,max_length=2000);publisher:str|None=Field(default=None,min_length=1,max_length=200);declared_language:str|None=Field(default=None,max_length=35);default_category:str|None=Field(default=None,max_length=60);trust_score:int|None=Field(default=None,ge=0,le=100)
+class FeedUrlTest(BaseModel): url:str=Field(min_length=1,max_length=2000)
 class JobAccepted(BaseModel): job_id: str; created: bool
+class EventPage(BaseModel): items:list[dict[str,Any]]; total:int; offset:int; limit:int; has_more:bool
 class EventPatch(BaseModel):
     version:int=Field(ge=1); reason:str=Field(min_length=1,max_length=1000)
     title_ja:str|None=Field(default=None,min_length=1,max_length=500); summary_ja:str|None=Field(default=None,min_length=1,max_length=10000); event_date:date|None=None
@@ -131,7 +142,7 @@ async def login(body:LoginInput,response:Response,request:Request,db:DB,settings
     user=(await db.execute(select(User).where(User.username==body.username,User.is_active.is_(True)))).scalar_one_or_none(); valid=verify_password(user.password_hash if user else DUMMY_ARGON2_HASH,body.password)
     if user is None or not valid: login_limiter.fail(key); raise HTTPException(401,"invalid credentials")
     login_limiter.clear(key); now=datetime.now(UTC); await db.execute(update(Session).where(Session.user_id==user.id,Session.revoked_at.is_(None)).values(revoked_at=now))
-    token,csrf=random_token(),random_token(); db.add(Session(user_id=user.id,token_hash=token_hash(token),csrf_token_hash=token_hash(csrf),expires_at=now+timedelta(seconds=settings.session_ttl_seconds),last_seen_at=now)); db.add(AuditLog(actor_user_id=user.id,action="auth.login",entity_type="session",request_id=request_id(request),before_values=None,after_values={"active_sessions":1},details={}))
+    token=random_token(); stored_token_hash=token_hash(token); csrf=token_hash(f"csrf:{stored_token_hash}"); db.add(Session(user_id=user.id,token_hash=stored_token_hash,csrf_token_hash=token_hash(csrf),expires_at=now+timedelta(seconds=settings.session_ttl_seconds),last_seen_at=now)); db.add(AuditLog(actor_user_id=user.id,action="auth.login",entity_type="session",request_id=request_id(request),before_values=None,after_values={"active_sessions":1},details={}))
     await db.commit(); response.set_cookie(settings.session_cookie_name,token,httponly=True,secure=settings.cookie_secure,samesite="strict",max_age=settings.session_ttl_seconds,path="/"); return LoginOutput(csrf_token=csrf)
 @app.post("/api/v1/auth/logout",status_code=204)
 async def logout(response:Response,request:Request,db:DB,auth:Auth,x_csrf_token:Annotated[str|None,Header()]=None):
@@ -140,10 +151,116 @@ async def logout(response:Response,request:Request,db:DB,auth:Auth,x_csrf_token:
     session.revoked_at=datetime.now(UTC); db.add(AuditLog(actor_user_id=user.id,action="auth.logout",entity_type="session",entity_id=str(session.id),request_id=request_id(request),before_values={"revoked":False},after_values={"revoked":True},details={})); await db.commit()
     settings=get_settings(); response.delete_cookie(settings.session_cookie_name,path="/",secure=settings.cookie_secure,httponly=True,samesite="strict")
 @app.get("/api/v1/auth/me",response_model=MeOutput)
-async def me(auth:Auth): _,u=auth; return MeOutput(id=str(u.id),username=u.username,is_admin=u.is_admin)
+async def me(response:Response,db:DB,auth:Auth):
+    session,u=auth
+    csrf=token_hash(f"csrf:{session.token_hash}")
+    expected_hash=token_hash(csrf)
+    if not hmac.compare_digest(session.csrf_token_hash,expected_hash): session.csrf_token_hash=expected_hash; await db.commit()
+    response.headers["Cache-Control"]="no-store"
+    return MeOutput(id=str(u.id),username=u.username,is_admin=u.is_admin,csrf_token=csrf)
 @app.get("/api/v1/feeds",response_model=list[FeedOutput])
 async def list_feeds(db:DB,admin:Admin):
-    rows=(await db.scalars(select(Feed).order_by(Feed.name))).all(); return [FeedOutput(id=str(f.id),name=f.name,url=f.url,publisher=f.publisher,enabled=f.enabled,fetch_interval_minutes=f.fetch_interval_minutes) for f in rows]
+    rows=(await db.scalars(select(Feed).order_by(Feed.name))).all(); return [feed_output(feed) for feed in rows]
+
+def normalized_feed_url(value:str,settings:Settings)->str:
+    try: parts=urlsplit(value.strip());port=parts.port
+    except ValueError as exc: raise HTTPException(422,"feed URL is invalid") from exc
+    host=(parts.hostname or "").lower().rstrip(".")
+    if parts.scheme!="https" or not host or parts.username or parts.password or port not in (None,443): raise HTTPException(422,"feed URL must be credential-free HTTPS on port 443")
+    if host not in settings.allowed_rss_hosts: raise HTTPException(422,"feed host is not allowlisted")
+    return urlunsplit(("https",host,parts.path or "/",parts.query,""))
+
+def feed_output(feed:Feed)->FeedOutput:
+    return FeedOutput(id=str(feed.id),name=feed.name,url=feed.url,publisher=feed.publisher,declared_language=feed.declared_language,default_category=feed.default_category,trust_score=feed.trust_score,enabled=feed.enabled,fetch_interval_minutes=feed.fetch_interval_minutes,next_fetch_at=feed.next_fetch_at,last_success_at=feed.last_success_at,last_failure_at=feed.last_failure_at,consecutive_failures=feed.consecutive_failures,updated_at=feed.updated_at,version=feed.version)
+
+async def validate_feed_source(url:str,settings:Settings)->int:
+    from .infrastructure.feeds.rss import FeedError,InvalidFeed,SafeFeedClient,parse_feed
+    client=SafeFeedClient(settings)
+    try:
+        fetched=await client.fetch(url)
+        if fetched.status_code!=200: raise FeedError("unexpected HTTP status",http_status=fetched.status_code)
+        parsed=parse_feed(fetched.body or b"",datetime.now(UTC),max_entries=settings.rss_max_entries,max_raw_entry_bytes=settings.rss_max_raw_entry_bytes)
+        if parsed.accepted<1: raise InvalidFeed("feed yielded no acceptable entries",total=parsed.total,rejected=parsed.rejected)
+        return parsed.accepted
+    finally: await client.aclose()
+
+@app.post("/api/v1/feeds",response_model=FeedOutput,status_code=201)
+async def create_feed(body:FeedCreate,request:Request,db:DB,admin:Admin,settings:Annotated[Settings,Depends(get_settings)],x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin;require_csrf(session,x_csrf_token);actor_user_id=user.id;normalized=normalized_feed_url(body.url,settings)
+    if await db.scalar(select(func.count()).select_from(Feed).where((Feed.url==body.url)|(Feed.normalized_url==normalized))): raise HTTPException(409,"feed URL already exists")
+    await db.rollback()  # do not hold an implicit read transaction during network I/O
+    try: await validate_feed_source(normalized,settings)
+    except Exception as exc:
+        from .infrastructure.feeds.rss import FeedError
+        if not isinstance(exc,FeedError): raise
+        raise HTTPException(422,f"feed validation failed: {exc.code}") from exc
+    if await db.scalar(select(func.count()).select_from(Feed).where((Feed.url==body.url)|(Feed.normalized_url==normalized))): raise HTTPException(409,"feed URL already exists")
+    feed=Feed(**body.model_dump(exclude={"url"}),url=normalized,normalized_url=normalized,next_fetch_at=datetime.now(UTC),consecutive_failures=0,version=1)
+    try:
+        db.add(feed);await db.flush();db.add(AuditLog(actor_user_id=actor_user_id,action="feed.created",entity_type="feed",entity_id=str(feed.id),request_id=request_id(request),before_values=None,after_values={"name":feed.name,"url":normalized,"publisher":feed.publisher,"declared_language":feed.declared_language,"default_category":feed.default_category,"fetch_interval_minutes":feed.fetch_interval_minutes,"enabled":feed.enabled,"trust_score":feed.trust_score,"version":feed.version},details={}));await db.commit()
+    except IntegrityError as exc:
+        await db.rollback();raise HTTPException(409,"feed URL already exists") from exc
+    await db.refresh(feed);return feed_output(feed)
+
+@app.post("/api/v1/feeds/test-url")
+async def test_feed_url(body:FeedUrlTest,request:Request,db:DB,admin:Admin,settings:Annotated[Settings,Depends(get_settings)],x_csrf_token:Annotated[str|None,Header()]=None):
+    from .infrastructure.feeds.rss import FeedError
+    session,user=admin;require_csrf(session,x_csrf_token);actor_user_id=user.id;url=normalized_feed_url(body.url,settings)
+    await db.rollback()
+    try:
+        accepted=await validate_feed_source(url,settings)
+    except FeedError as exc:
+        failure={"error_code":exc.code,"http_status":exc.http_status};db.add(AuditLog(actor_user_id=actor_user_id,action="feed.url_test_failed",entity_type="feed_candidate",entity_id=None,request_id=request_id(request),before_values=None,after_values=failure,details={"host":urlsplit(url).hostname}));await db.commit();raise HTTPException(422 if exc.code=="invalid_feed" else 503,f"feed test failed: {exc.code}") from exc
+    result={"reachable":True,"http_status":200,"accepted_entries":accepted};db.add(AuditLog(actor_user_id=actor_user_id,action="feed.url_test",entity_type="feed_candidate",entity_id=None,request_id=request_id(request),before_values=None,after_values=result,details={"host":urlsplit(url).hostname}));await db.commit();return result
+
+@app.patch("/api/v1/feeds/{feed_id}",response_model=FeedOutput)
+async def patch_feed(feed_id:uuid.UUID,body:FeedPatch,request:Request,db:DB,admin:Admin,settings:Annotated[Settings,Depends(get_settings)],x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token);actor_user_id=user.id
+    initial=await db.get(Feed,feed_id)
+    if initial is None: raise HTTPException(404,"feed not found")
+    values=body.model_dump(exclude={"version"},exclude_unset=True)
+    if not values: raise HTTPException(422,"at least one feed field is required")
+    initial_normalized,initial_enabled=initial.normalized_url,initial.enabled
+    candidate=normalized_feed_url(values["url"],settings) if "url" in values else initial_normalized
+    requires_validation=("url" in values and candidate!=initial_normalized) or (values.get("enabled") is True and not initial_enabled)
+    if requires_validation:
+        await db.rollback()  # release the implicit read transaction before network I/O
+        try: await validate_feed_source(candidate,settings)
+        except Exception as exc:
+            from .infrastructure.feeds.rss import FeedError
+            if not isinstance(exc,FeedError): raise
+            raise HTTPException(422,f"feed validation failed: {exc.code}") from exc
+    feed=(await db.scalars(select(Feed).where(Feed.id==feed_id).with_for_update())).one_or_none()
+    if feed is None: raise HTTPException(404,"feed not found")
+    if feed.version!=body.version: raise HTTPException(409,"feed version conflict")
+    if "url" in values:
+        normalized=normalized_feed_url(values["url"],settings)
+        duplicate=await db.scalar(select(func.count()).select_from(Feed).where(Feed.id!=feed.id,((Feed.url==values["url"])|(Feed.normalized_url==normalized))))
+        if duplicate: raise HTTPException(409,"feed URL already exists")
+        values["url"]=normalized;values["normalized_url"]=normalized;feed.etag=None;feed.last_modified=None
+    before={name:getattr(feed,name) for name in values}
+    for name,value in values.items(): setattr(feed,name,value)
+    if values.get("enabled") is True: feed.next_fetch_at=datetime.now(UTC)
+    feed.version+=1
+    db.add(AuditLog(actor_user_id=actor_user_id,action="feed.updated",entity_type="feed",entity_id=str(feed.id),request_id=request_id(request),before_values=before,after_values=values,details={}))
+    try: await db.commit()
+    except IntegrityError as exc:
+        await db.rollback();raise HTTPException(409,"feed URL already exists") from exc
+    await db.refresh(feed)
+    return feed_output(feed)
+
+@app.post("/api/v1/feeds/{feed_id}/test")
+async def test_feed(feed_id:uuid.UUID,request:Request,db:DB,admin:Admin,settings:Annotated[Settings,Depends(get_settings)],x_csrf_token:Annotated[str|None,Header()]=None):
+    from .infrastructure.feeds.rss import FeedError
+    session,user=admin; require_csrf(session,x_csrf_token);actor_user_id=user.id;feed=await db.get(Feed,feed_id)
+    if feed is None: raise HTTPException(404,"feed not found")
+    url,entity_id=feed.url,str(feed.id);await db.rollback()
+    try:
+        accepted=await validate_feed_source(url,settings)
+    except FeedError as exc:
+        failure={"error_code":exc.code,"http_status":exc.http_status};db.add(AuditLog(actor_user_id=actor_user_id,action="feed.test_failed",entity_type="feed",entity_id=entity_id,request_id=request_id(request),before_values=None,after_values=failure,details={})); await db.commit(); raise HTTPException(422 if exc.code=="invalid_feed" else 503,f"feed test failed: {exc.code}") from exc
+    result={"reachable":True,"http_status":200,"accepted_entries":accepted}
+    db.add(AuditLog(actor_user_id=actor_user_id,action="feed.test",entity_type="feed",entity_id=entity_id,request_id=request_id(request),before_values=None,after_values=result,details={})); await db.commit(); return result
 
 def require_csrf(session:Session,value:str|None)->None:
     if not value or not hmac.compare_digest(token_hash(value),session.csrf_token_hash): raise HTTPException(403,"invalid CSRF token")
@@ -184,6 +301,25 @@ async def fetch_feed(feed_id:uuid.UUID,request:Request,db:DB,admin:Admin,x_csrf_
 async def list_jobs(db:DB,admin:Admin,limit:int=50):
     limit=max(1,min(limit,200)); rows=(await db.scalars(select(Job).order_by(Job.created_at.desc()).limit(limit))).all()
     return [{"id":str(j.id),"job_type":j.job_type.value,"status":j.status.value,"attempts":j.attempts,"max_attempts":j.max_attempts,"run_after":j.run_after,"last_error_code":j.last_error_code,"created_at":j.created_at} for j in rows]
+
+@app.post("/api/v1/jobs/{job_id}/retry",response_model=JobAccepted,status_code=202)
+async def retry_job(job_id:uuid.UUID,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
+    session,user=admin; require_csrf(session,x_csrf_token)
+    job=(await db.scalars(select(Job).where(Job.id==job_id).with_for_update())).one_or_none()
+    if job is None: raise HTTPException(404,"job not found")
+    if job.status!=JobStatus.dead: raise HTTPException(409,"only dead jobs can be retried")
+    if job.dedupe_key:
+        active=await db.scalar(select(func.count()).select_from(Job).where(Job.id!=job.id,Job.job_type==job.job_type,Job.dedupe_key==job.dedupe_key,Job.status.in_([JobStatus.queued,JobStatus.running,JobStatus.retry_wait])))
+        if active: raise HTTPException(409,"an active replacement job already exists")
+    if job.job_type==JobType.fetch_feed and job.payload.get("feed_id"):
+        try: retry_feed=await db.get(Feed,uuid.UUID(str(job.payload["feed_id"])))
+        except ValueError: retry_feed=None
+        if retry_feed is None: raise HTTPException(409,"source feed no longer exists")
+        if not retry_feed.enabled: raise HTTPException(409,"enable the feed before retrying its job")
+    before={"status":job.status.value,"attempts":job.attempts,"last_error_code":job.last_error_code}
+    job.status=JobStatus.queued; job.attempts=0; job.run_after=datetime.now(UTC); job.finished_at=None; job.started_at=None; job.last_error_code=None; job.last_error_message=None
+    db.add(AuditLog(actor_user_id=user.id,action="job.retried",entity_type="job",entity_id=str(job.id),request_id=request_id(request),before_values=before,after_values={"status":"queued","attempts":0},details={})); await db.commit()
+    return JobAccepted(job_id=str(job.id),created=False)
 
 @app.get("/api/v1/fetch-runs")
 async def list_fetch_runs(db:DB,admin:Admin,limit:int=50):
@@ -241,22 +377,82 @@ async def reanalyze_event(event_id:uuid.UUID,request:Request,db:DB,admin:Admin,x
     return JobAccepted(job_id=str(job_id),created=created)
 
 def event_output(event:Event)->dict[str,Any]:
-    return {"id":str(event.id),**snapshot(event),"current_revision_id":str(event.current_revision_id) if event.current_revision_id else None,"rule_version":event.rule_version,"prompt_version":event.prompt_version}
+    return {"id":str(event.id),**snapshot(event),"current_revision_id":str(event.current_revision_id) if event.current_revision_id else None,"rule_version":event.rule_version,"prompt_version":event.prompt_version,"created_at":event.created_at,"updated_at":event.updated_at}
 
-@app.get("/api/v1/events")
-async def list_events(db:DB,admin:Admin,status:PublicationStatus|None=None,limit:int=50):
-    query=select(Event).order_by(Event.event_date.desc(),Event.updated_at.desc()).limit(max(1,min(limit,200)))
-    if status is not None: query=query.where(Event.publication_status==status)
-    return [event_output(e) for e in (await db.scalars(query)).all()]
+@app.get("/api/v1/calendar")
+async def calendar_month(month:str,db:DB,admin:Admin,include_drafts:bool=False):
+    """Return a compact month projection; event bodies remain in /events."""
+    try:
+        if re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])",month) is None: raise ValueError
+        start=datetime.strptime(month,"%Y-%m").date().replace(day=1)
+    except ValueError as exc:
+        raise HTTPException(422,"month must be YYYY-MM") from exc
+    end=(start.replace(day=28)+timedelta(days=4)).replace(day=1)
+    statuses=[PublicationStatus.approved]
+    if include_drafts: statuses.extend([PublicationStatus.draft,PublicationStatus.needs_review])
+    importance_rank=case(
+        (Event.importance_level==Importance.high,4),(Event.importance_level==Importance.middle_high,3),
+        (Event.importance_level==Importance.middle,2),(Event.importance_level==Importance.low,1),else_=0,
+    )
+    rows=(await db.execute(
+        select(Event.event_date,func.count(Event.id),func.max(importance_rank),func.bool_or(Event.must_include),func.array_agg(Event.category.distinct()))
+        .where(Event.event_date>=start,Event.event_date<end,Event.publication_status.in_(statuses),Event.merged_into_event_id.is_(None))
+        .group_by(Event.event_date).order_by(Event.event_date)
+    )).all()
+    by_rank={4:"high",3:"middle_high",2:"middle",1:"low",0:None}
+    return {"month":month,"days":[{"date":day.isoformat(),"count":count,"highest_importance":by_rank[rank],"has_must_include":bool(must),"categories":sorted(categories or [])[:5]} for day,count,rank,must,categories in rows]}
+
+@app.get("/api/v1/events",response_model=EventPage)
+async def list_events(db:DB,admin:Admin,status:PublicationStatus|None=None,event_date:date|None=None,date_from:date|None=None,date_to:date|None=None,category:str|None=None,importance:Importance|None=None,publisher:str|None=None,source_feed_id:uuid.UUID|None=None,q:str|None=None,limit:int=50,offset:int=0):
+    limit=max(1,min(limit,100)); offset=max(0,min(offset,100_000))
+    importance_rank=case(
+        (Event.importance_level==Importance.high,4),(Event.importance_level==Importance.middle_high,3),
+        (Event.importance_level==Importance.middle,2),(Event.importance_level==Importance.low,1),else_=0,
+    )
+    filters=[Event.merged_into_event_id.is_(None)]
+    if status is not None: filters.append(Event.publication_status==status)
+    if event_date is not None: filters.append(Event.event_date==event_date)
+    if date_from is not None: filters.append(Event.event_date>=date_from)
+    if date_to is not None: filters.append(Event.event_date<=date_to)
+    if date_from and date_to and date_from>date_to: raise HTTPException(422,"date_from must not be after date_to")
+    if category: filters.append(Event.category==category)
+    if importance: filters.append(Event.importance_level==importance)
+    source_filters=[]
+    if source_feed_id: source_filters.append(Feed.id==source_feed_id)
+    if publisher and publisher.strip():
+        literal_publisher=publisher.strip()[:100].replace("\\","\\\\").replace("%","\\%").replace("_","\\_")
+        source_filters.append(Feed.publisher.ilike(f"%{literal_publisher}%",escape="\\"))
+    if source_filters:
+        filters.append(Event.id.in_(select(EventArticle.event_id).join(Article,Article.id==EventArticle.article_id).join(Feed,Feed.id==Article.feed_id).where(*source_filters)))
+    if q and q.strip():
+        literal=q.strip()[:200].replace("\\","\\\\").replace("%","\\%").replace("_","\\_")
+        pattern=f"%{literal}%"
+        filters.append(or_(Event.title_ja.ilike(pattern,escape="\\"),Event.summary_ja.ilike(pattern,escape="\\"),Event.category.ilike(pattern,escape="\\")))
+    query=select(Event).where(*filters).order_by(Event.event_date.desc(),importance_rank.desc(),Event.updated_at.desc(),Event.id).offset(offset).limit(limit)
+    total=int((await db.scalar(select(func.count()).select_from(Event).where(*filters))) or 0)
+    items=[event_output(e) for e in (await db.scalars(query)).all()]
+    return EventPage(items=items,total=total,offset=offset,limit=limit,has_more=offset+len(items)<total)
 
 @app.get("/api/v1/events/{event_id}")
 async def get_event(event_id:uuid.UUID,db:DB,admin:Admin):
     event=await db.get(Event,event_id)
     if event is None: raise HTTPException(404,"event not found")
-    links=(await db.execute(select(EventArticle,Article).join(Article,Article.id==EventArticle.article_id).where(EventArticle.event_id==event_id))).all()
+    links=(await db.execute(select(EventArticle,Article,Feed).join(Article,Article.id==EventArticle.article_id).join(Feed,Feed.id==Article.feed_id).where(EventArticle.event_id==event_id))).all()
     revisions=(await db.scalars(select(EventRevision).where(EventRevision.event_id==event_id).order_by(EventRevision.version.desc()).limit(50))).all()
-    result=event_output(event); result["articles"]=[{"id":str(a.id),"title":a.title_raw,"url":a.source_url,"published_at":a.published_at,"is_primary_source":link.is_primary_source,"link_reason":link.link_reason} for link,a in links]; result["revisions"]=[{"id":str(r.id),"version":r.version,"reason":r.reason,"created_at":r.created_at} for r in revisions]
+    source_ids=select(EventArticle.article_id).where(EventArticle.event_id==event.id)
+    ai_run=(await db.scalars(select(AIRun).where((AIRun.event_id==event.id)|(AIRun.article_id.in_(source_ids)),AIRun.status==AIRunStatus.succeeded).order_by(AIRun.finished_at.desc()).limit(1))).one_or_none()
+    result=event_output(event); result["articles"]=[{"id":str(a.id),"title":a.title_raw,"url":a.source_url,"published_at":a.published_at,"publisher":feed.publisher,"feed_id":str(feed.id),"is_primary_source":link.is_primary_source,"link_reason":link.link_reason} for link,a,feed in links]; result["revisions"]=[{"id":str(r.id),"version":r.version,"reason":r.reason,"created_at":r.created_at} for r in revisions]
+    result["ai_proposal"]={"values":ai_run.parsed_output,"provider":ai_run.provider,"model":ai_run.model,"prompt_version":ai_run.prompt_version,"rule_version":ai_run.rule_version,"finished_at":ai_run.finished_at} if ai_run else None
     return result
+
+@app.get("/api/v1/events/{event_id}/similar-examples")
+async def get_similar_examples(event_id:uuid.UUID,db:DB,admin:Admin,limit:int=5):
+    from pathlib import Path
+    from .application.evals import similar_cases
+    event=await db.get(Event,event_id)
+    if event is None: raise HTTPException(404,"event not found")
+    root=Path(__file__).resolve().parents[3];path=(root/"evals"/"importance-v1.jsonl") if (root/"evals").exists() else Path("/app/evals/importance-v1.jsonl")
+    return similar_cases(path,f"{event.title_ja} {event.summary_ja} {event.importance_reason or ''}",category=event.category,limit=limit)
 
 @app.patch("/api/v1/events/{event_id}")
 async def patch_event(event_id:uuid.UUID,body:EventPatch,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
@@ -295,22 +491,14 @@ async def cluster_candidates(event_id:uuid.UUID,db:DB,admin:Admin):
 @app.patch("/api/v1/events/{event_id}/cluster-candidates/{candidate_id}")
 async def review_cluster_candidate(event_id:uuid.UUID,candidate_id:uuid.UUID,body:CandidateReviewInput,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
     session,user=admin; require_csrf(session,x_csrf_token)
-    if body.status==ClusterCandidateStatus.pending: raise HTTPException(422,"candidate must be accepted or dismissed")
-    candidate=(await db.scalars(select(EventClusterCandidate).where(EventClusterCandidate.id==candidate_id,((EventClusterCandidate.event_id==event_id)|(EventClusterCandidate.candidate_event_id==event_id))).with_for_update())).one_or_none()
-    if candidate is None: raise HTTPException(404,"cluster candidate not found")
-    if candidate.status!=ClusterCandidateStatus.pending: raise HTTPException(409,"cluster candidate was already reviewed")
-    participants=(await db.scalars(select(Event).where(Event.id.in_([candidate.event_id,candidate.candidate_event_id])))).all()
-    if len(participants)!=2 or any(event.publication_status==PublicationStatus.hidden or event.merged_into_event_id is not None for event in participants):
-        candidate.status=ClusterCandidateStatus.dismissed; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
-        db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_invalidated",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id(request),before_values={"status":"pending"},after_values={"status":"dismissed"},details={"reason":"event unavailable"})); await db.commit()
-        return {"id":str(candidate.id),"status":"dismissed","invalidated":True}
-    before={"status":candidate.status.value}; candidate.status=body.status; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
-    db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_reviewed",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id(request),before_values=before,after_values={"status":body.status.value},details={"reason":body.reason})); await db.commit()
-    return {"id":str(candidate.id),"status":candidate.status.value}
+    candidate,invalid=await decide_cluster_candidate(db,candidate_id,event_id,user,body.status,body.reason,request_id(request)); await db.commit()
+    return {"id":str(candidate.id),"status":candidate.status.value,"invalidated":invalid}
 
 @app.post("/api/v1/events/{event_id}/cluster",response_model=JobAccepted,status_code=202)
 async def request_cluster(event_id:uuid.UUID,request:Request,db:DB,admin:Admin,x_csrf_token:Annotated[str|None,Header()]=None):
     session,user=admin; require_csrf(session,x_csrf_token)
-    if await db.get(Event,event_id) is None: raise HTTPException(404,"event not found")
+    event=(await db.scalars(select(Event).where(Event.id==event_id).with_for_update())).one_or_none()
+    if event is None: raise HTTPException(404,"event not found")
+    if event.publication_status==PublicationStatus.hidden or event.merged_into_event_id is not None: raise HTTPException(409,"hidden or merged event cannot be clustered")
     job_id,created=await enqueue_or_active(db,JobType.cluster_event,{"event_id":str(event_id)},f"event:{event_id}:cluster",max_attempts=2)
     db.add(AuditLog(actor_user_id=user.id,action="event.cluster_requested",entity_type="event",entity_id=str(event_id),request_id=request_id(request),before_values=None,after_values={"job_id":str(job_id)},details={})); await db.commit(); return JobAccepted(job_id=str(job_id),created=created)

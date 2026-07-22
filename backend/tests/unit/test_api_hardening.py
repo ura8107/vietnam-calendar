@@ -98,6 +98,28 @@ def test_last_seen_is_throttled():
     assert not should_update_last_seen(now-timedelta(minutes=4),now)
     assert should_update_last_seen(now-timedelta(minutes=6),now)
 
+def test_me_recovers_stable_csrf_for_new_tab_and_logout():
+    session,user=auth_pair(csrf="legacy")
+    async def auth(): return session,user
+    class DB:
+        commits=0
+        def add(self,value): pass
+        async def commit(self): self.commits+=1
+    database=DB()
+    async def db(): yield database
+    app.dependency_overrides[current_session]=auth; app.dependency_overrides[get_session]=db
+    try:
+        with TestClient(app) as client:
+            first=client.get("/api/v1/auth/me")
+            second=client.get("/api/v1/auth/me")
+            token=second.json()["csrf_token"]
+            logout=client.post("/api/v1/auth/logout",headers={"x-csrf-token":token})
+        assert first.status_code==200 and first.headers["cache-control"]=="no-store"
+        assert first.json()["csrf_token"]==token
+        assert logout.status_code==204
+        assert token not in logout.text
+    finally: app.dependency_overrides.clear()
+
 
 def test_manual_fetch_requires_csrf_and_is_idempotent_202(monkeypatch):
     feed_id=uuid.uuid4(); job_id=uuid.uuid4(); calls=[job_id,None]

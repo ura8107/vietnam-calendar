@@ -9,9 +9,9 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from vietnam_calendar.events import generate_cluster_candidates, merge_events, review_event, split_event
+from vietnam_calendar.events import decide_cluster_candidate, generate_cluster_candidates, merge_events, review_event, split_event
 from vietnam_calendar.models import (Article, AuditLog, Certainty, DateCertainty,
-    DateSource, Event, EventArticle, EventClusterCandidate, Feed, Importance, ProcessingStatus,
+    ClusterCandidateStatus, DateSource, Event, EventArticle, EventClusterCandidate, Feed, Importance, ProcessingStatus,
     PublicationStatus, Relevance, ReviewDecision, User)
 
 pytestmark=pytest.mark.skipif(not os.getenv("PHASE4_TEST_DATABASE_URL"),reason="requires explicit PostgreSQL test database")
@@ -28,11 +28,16 @@ async def test_review_merge_split_preserve_articles_revisions_and_audit():
         for n in range(3):
             articles.append(Article(feed_id=feed.id,source_url=f"https://news.tuoitre.vn/phase4-{uuid.uuid4()}",normalized_url=f"https://news.tuoitre.vn/phase4-{uuid.uuid4()}",identity_key=f"url:{uuid.uuid4().hex}",title_raw=f"source {n}",title_normalized=f"source {n}",content_hash="0"*64,raw_entry={},date_source=DateSource.fetched,processing_status=ProcessingStatus.needs_review))
         target,source=new_event("target"),new_event("source"); db.add_all([user,target,source,*articles]); await db.flush()
-        db.add_all([EventArticle(event_id=target.id,article_id=articles[0].id,is_primary_source=True,link_reason="seed"),EventArticle(event_id=source.id,article_id=articles[1].id,is_primary_source=True,link_reason="seed"),EventArticle(event_id=source.id,article_id=articles[2].id,is_primary_source=False,link_reason="seed")]); await db.commit()
+        target_link=EventArticle(event_id=target.id,article_id=articles[0].id,is_primary_source=True,link_reason="seed")
+        db.add_all([target_link,EventArticle(event_id=source.id,article_id=articles[0].id,is_primary_source=True,link_reason="duplicate primary"),EventArticle(event_id=source.id,article_id=articles[1].id,is_primary_source=False,link_reason="seed"),EventArticle(event_id=source.id,article_id=articles[2].id,is_primary_source=False,link_reason="seed")]); await db.commit()
         await review_event(db,target,user,ReviewDecision.approve,1,"verified",None,rid); await db.commit(); assert target.publication_status==PublicationStatus.approved
+        target_link.is_primary_source=False; await db.commit()  # exercise deterministic promotion of a duplicate source-primary
+        first,second=sorted((target.id,source.id),key=str); accepted=EventClusterCandidate(event_id=first,candidate_event_id=second,similarity_score=.8,reasons=["test"],status=ClusterCandidateStatus.accepted); db.add(accepted); await db.commit()
         await merge_events(db,target,source,user,2,1,"same formal decision",rid); await db.commit()
         assert target.publication_status==PublicationStatus.needs_review and source.publication_status==PublicationStatus.hidden
+        assert accepted.status==ClusterCandidateStatus.dismissed
         assert (await db.scalar(select(func.count()).select_from(EventArticle).where(EventArticle.event_id==target.id)))==3
+        assert (await db.scalar(select(func.count()).select_from(EventArticle).where(EventArticle.event_id==target.id,EventArticle.is_primary_source.is_(True))))==1
         with pytest.raises(IntegrityError):
             async with db.begin_nested():
                 target.current_revision_id=source.current_revision_id; await db.flush()
@@ -47,8 +52,36 @@ async def test_review_merge_split_preserve_articles_revisions_and_audit():
         await asyncio.gather(generate_cluster_candidates(factory,orphan.id),generate_cluster_candidates(factory,peer.id))
         pair_count=await db.scalar(select(func.count()).select_from(EventClusterCandidate).where(((EventClusterCandidate.event_id==orphan.id)&(EventClusterCandidate.candidate_event_id==peer.id))|((EventClusterCandidate.event_id==peer.id)&(EventClusterCandidate.candidate_event_id==orphan.id))))
         assert pair_count==1
-        candidate_ids=[str(value) for value in (await db.scalars(select(EventClusterCandidate.id).where((EventClusterCandidate.event_id.in_([orphan.id,peer.id]))|(EventClusterCandidate.candidate_event_id.in_([orphan.id,peer.id]))))).all()]
-        owned_event_ids=[target.id,source.id,split.id,orphan.id,peer.id]
+        race_a,race_b=new_event("Vietnam bank race decision"),new_event("Vietnam bank race decision update"); db.add_all([race_a,race_b]); await db.flush(); rf,rs=sorted((race_a.id,race_b.id),key=str); race_candidate=EventClusterCandidate(event_id=rf,candidate_event_id=rs,similarity_score=.9,reasons=["race"]); db.add(race_candidate); await db.commit()
+        async def decide_race():
+            async with factory() as session:
+                actor=await session.get(User,user.id)
+                try: await decide_cluster_candidate(session,race_candidate.id,race_a.id,actor,ClusterCandidateStatus.accepted,"race",rid)
+                except HTTPException as exc:
+                    assert exc.status_code==409
+                await session.commit()
+        async def merge_race():
+            async with factory() as session:
+                actor=await session.get(User,user.id); left=await session.get(Event,race_a.id); right=await session.get(Event,race_b.id)
+                await merge_events(session,left,right,actor,1,1,"race merge",rid); await session.commit()
+        await asyncio.wait_for(asyncio.gather(decide_race(),merge_race()),timeout=10)
+        await db.refresh(race_candidate); assert race_candidate.status==ClusterCandidateStatus.dismissed
+        generation_a,generation_b=new_event("Vietnam fiscal generation race"),new_event("Vietnam fiscal generation race update"); db.add_all([generation_a,generation_b]); await db.commit()
+        async def merge_generation_race():
+            async with factory() as session:
+                actor=await session.get(User,user.id); left=await session.get(Event,generation_a.id); right=await session.get(Event,generation_b.id)
+                await merge_events(session,left,right,actor,1,1,"generation race",rid); await session.commit()
+        await asyncio.wait_for(asyncio.gather(generate_cluster_candidates(factory,generation_a.id),merge_generation_race()),timeout=10)
+        active_stale=await db.scalar(select(func.count()).select_from(EventClusterCandidate).where(EventClusterCandidate.status!=ClusterCandidateStatus.dismissed,((EventClusterCandidate.event_id.in_([generation_a.id,generation_b.id]))|(EventClusterCandidate.candidate_event_id.in_([generation_a.id,generation_b.id])))))
+        assert active_stale==0
+        crossed=[new_event(f"Vietnam crossed generation decision {index}") for index in range(4)]; db.add_all(crossed); await db.commit(); crossed_ids=[event.id for event in crossed]
+        await asyncio.wait_for(asyncio.gather(*(generate_cluster_candidates(factory,event.id) for event in crossed)),timeout=10)
+        crossed_candidates=(await db.scalars(select(EventClusterCandidate).where(EventClusterCandidate.event_id.in_(crossed_ids),EventClusterCandidate.candidate_event_id.in_(crossed_ids)))).all()
+        pairs={(candidate.event_id,candidate.candidate_event_id) for candidate in crossed_candidates}
+        assert len(crossed_candidates)==6 and len(pairs)==6
+        assert all(candidate.status==ClusterCandidateStatus.pending for candidate in crossed_candidates)
+        owned_event_ids=[target.id,source.id,split.id,orphan.id,peer.id,race_a.id,race_b.id,generation_a.id,generation_b.id,*crossed_ids]
+        candidate_ids=[str(value) for value in (await db.scalars(select(EventClusterCandidate.id).where((EventClusterCandidate.event_id.in_(owned_event_ids))|(EventClusterCandidate.candidate_event_id.in_(owned_event_ids))))).all()]
         await db.execute(update(Event).where(Event.id.in_(owned_event_ids)).values(current_revision_id=None)); await db.flush()
         await db.execute(delete(Event).where(Event.id.in_(owned_event_ids)))
         await db.execute(delete(Article).where(Article.id.in_([article.id for article in articles])))

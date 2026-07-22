@@ -46,8 +46,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    ports:
-      - "127.0.0.1:8080:8000"
+    expose:
+      - "8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
       interval: 10s
@@ -76,6 +76,17 @@ services:
       migrate:
         condition: service_completed_successfully
     command: ["python", "-m", "vietnam_calendar.worker"]
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:80"
     restart: unless-stopped
 
   ollama:

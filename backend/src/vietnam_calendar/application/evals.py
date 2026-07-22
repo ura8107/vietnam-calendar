@@ -2,6 +2,8 @@ from __future__ import annotations
 import hashlib,json
 from pathlib import Path
 from typing import Any
+from difflib import SequenceMatcher
+import re
 from .importance import classify
 
 LEVELS={"low":0,"middle":1,"middle_high":2,"high":3}
@@ -20,3 +22,20 @@ def evaluate_rules(path:Path)->dict[str,Any]:
     out=[(c,row) for c,row in zip(cases,rows) if c["expected_relevance"]=="out_of_scope"]
     ratio=lambda n,d: n/d if d else 1.0
     return {"rubric_version":"importance-rubric-v1","dataset_sha256":digest,"case_count":57,"exact_accuracy":ratio(sum(x["exact"] for x in rows),57),"within_one_accuracy":ratio(sum(x["within_one"] for x in rows),57),"must_include_recall":ratio(sum(row["actual_must_include"] for _,row in must),len(must)),"must_include_gate_passed":all(row["actual_must_include"] for _,row in must),"target_recall":ratio(sum(row["actual_relevance"]=="target" for _,row in targets),len(targets)),"out_of_scope_recall":ratio(sum(row["actual_relevance"]=="out_of_scope" for _,row in out),len(out)),"schema_success_rate":1.0,"cases":rows}
+
+def similar_cases(path:Path,query:str,*,category:str|None=None,limit:int=5)->dict[str,Any]:
+    """Deterministic corpus lookup; never asks an AI to invent precedents."""
+    cases,digest=load_cases(path);limit=max(1,min(limit,10))
+    tokens=lambda value:set(re.findall(r"[\w]+",value.casefold()))
+    query_tokens=tokens(f"{query} {category or ''}")
+    rows=[]
+    for case in cases:
+        candidate_tokens=tokens(f"{case['scenario']} {' '.join(case.get('tags',[]))}")
+        union=query_tokens|candidate_tokens
+        jaccard=len(query_tokens&candidate_tokens)/len(union) if union else 0.0
+        sequence=SequenceMatcher(None,query.casefold(),case["scenario"].casefold()).ratio()
+        category_match=1.0 if category and category.casefold() in {str(tag).casefold() for tag in case.get("tags",[])} else 0.0
+        score=.55*jaccard+.35*sequence+.10*category_match
+        rows.append({"id":case["id"],"scenario":case["scenario"],"expected_relevance":case["expected_relevance"],"expected_importance":case["expected_importance"],"must_include":case["must_include"],"reason":case["reason"],"tags":case.get("tags",[]),"similarity":round(score,6)})
+    rows.sort(key=lambda row:(-row["similarity"],row["id"]))
+    return {"dataset_version":"importance-v1","dataset_sha256":digest,"rubric_version":"importance-rubric-v1","matches":rows[:limit]}

@@ -1,0 +1,4 @@
+.mobile-days{display:none;gap:.5rem;margin:1rem 0 2rem}
+.mobile-days button{display:block;width:100%;text-align:left;background:var(--paper);color:var(--ink);border:1px solid var(--line)}
+pre{max-height:24rem;overflow:auto;white-space:pre-wrap;background:#f5f2e9;padding:1rem}
+@media(max-width:650px){.calendar-wrap{display:none}.mobile-days{display:grid}.toolbar{flex-wrap:wrap}}

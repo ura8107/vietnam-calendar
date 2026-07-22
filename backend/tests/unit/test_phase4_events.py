@@ -7,9 +7,9 @@ from fastapi.testclient import TestClient
 
 from vietnam_calendar.api import app, current_session
 from vietnam_calendar.db import get_session
-from vietnam_calendar.events import require_publishable, snapshot, title_similarity, validate_human_values
+from vietnam_calendar.events import require_publishable, review_event, snapshot, title_similarity, validate_human_values
 from vietnam_calendar.models import (Certainty, DateCertainty, Event, Importance,
-                                      PublicationStatus, Relevance)
+                                      PublicationStatus, Relevance, ReviewDecision)
 
 def event():
     return Event(id=uuid.uuid4(),title_ja="ベトナム中銀が政策金利を決定",summary_ja="正式決定",event_date=date(2026,7,18),date_certainty=DateCertainty.confirmed,category="economy",relevance_status=Relevance.target,relevance_reason="Vietnam",importance_level=Importance.high,importance_score=90,importance_reason="nationwide",must_include=True,must_include_reason="formal policy",certainty=Certainty.confirmed,publication_status=PublicationStatus.needs_review,rule_version="v1",prompt_version="v1",version=2)
@@ -39,6 +39,19 @@ async def test_approval_requires_reason_source_target_and_complete_importance():
     with pytest.raises(HTTPException): await require_publishable(DB(),value,"checked")
     value.importance_reason="national"; value.merged_into_event_id=uuid.uuid4()
     with pytest.raises(HTTPException): await require_publishable(DB(),value,"checked")
+
+@pytest.mark.asyncio
+async def test_approval_requires_exactly_one_primary_and_tombstone_is_terminal():
+    class Counts:
+        def __init__(self): self.values=iter((1,0))
+        async def scalar(self,query): return next(self.values)
+    value=event()
+    with pytest.raises(HTTPException) as missing_primary: await require_publishable(Counts(),value,"checked")
+    assert "exactly one primary" in missing_primary.value.detail
+    value.merged_into_event_id=uuid.uuid4()
+    for decision in ReviewDecision:
+        with pytest.raises(HTTPException) as terminal: await review_event(SimpleNamespace(),value,SimpleNamespace(),decision,2,"reason",None,"request")
+        assert terminal.value.status_code==409
 
 def test_event_mutation_requires_auth_and_csrf():
     value=event(); user=SimpleNamespace(id=uuid.uuid4(),is_admin=True); session=SimpleNamespace(csrf_token_hash=__import__("vietnam_calendar.security",fromlist=["token_hash"]).token_hash("csrf"))

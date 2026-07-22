@@ -42,10 +42,26 @@ async def require_publishable(db:AsyncSession,event:Event,reason:str|None)->None
     if any(value is None or (isinstance(value,str) and not value.strip()) for value in required): raise HTTPException(422,"event is not publishable")
     validate_human_values(snapshot(event))
     article_count=await db.scalar(select(func.count()).select_from(EventArticle).where(EventArticle.event_id==event.id))
+    primary_count=await db.scalar(select(func.count()).select_from(EventArticle).where(EventArticle.event_id==event.id,EventArticle.is_primary_source.is_(True)))
     if not article_count: raise HTTPException(422,"approved event requires a source article")
+    if primary_count!=1: raise HTTPException(422,"approved event requires exactly one primary source")
 
 def _audit(db:AsyncSession,user:User,action:str,event_id:uuid.UUID,request_id:str,before:dict|None,after:dict|None,details:dict|None=None)->None:
     db.add(AuditLog(actor_user_id=user.id,action=action,entity_type="event",entity_id=str(event_id),request_id=request_id,before_values=before,after_values=after,details=details or {}))
+
+async def decide_cluster_candidate(db:AsyncSession,candidate_id:uuid.UUID,event_id:uuid.UUID,user:User,status:ClusterCandidateStatus,reason:str,request_id:str)->tuple[EventClusterCandidate,bool]:
+    if status==ClusterCandidateStatus.pending: raise HTTPException(422,"candidate must be accepted or dismissed")
+    observed=await db.get(EventClusterCandidate,candidate_id)
+    if observed is None or event_id not in {observed.event_id,observed.candidate_event_id}: raise HTTPException(404,"cluster candidate not found")
+    participant_ids=sorted((observed.event_id,observed.candidate_event_id),key=str)
+    participants=(await db.scalars(select(Event).where(Event.id.in_(participant_ids)).order_by(Event.id).with_for_update())).all()
+    candidate=(await db.scalars(select(EventClusterCandidate).where(EventClusterCandidate.id==candidate_id).with_for_update())).one_or_none()
+    if candidate is None: raise HTTPException(404,"cluster candidate not found")
+    if candidate.status!=ClusterCandidateStatus.pending: raise HTTPException(409,"cluster candidate was already reviewed")
+    invalid=len(participants)!=2 or any(event.publication_status==PublicationStatus.hidden or event.merged_into_event_id is not None for event in participants)
+    candidate.status=ClusterCandidateStatus.dismissed if invalid else status; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
+    db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_invalidated" if invalid else "event.cluster_candidate_reviewed",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id,before_values={"status":"pending"},after_values={"status":candidate.status.value},details={"reason":"event unavailable" if invalid else reason}))
+    return candidate,invalid
 
 async def revise_event(db:AsyncSession,event:Event,user:User,values:dict[str,Any],expected_version:int,reason:str,request_id:str)->Event:
     if event.version != expected_version: raise HTTPException(409,"event version conflict")
@@ -63,6 +79,7 @@ async def revise_event(db:AsyncSession,event:Event,user:User,values:dict[str,Any
 
 async def review_event(db:AsyncSession,event:Event,user:User,decision:ReviewDecision,expected_version:int,reason:str|None,uncertainty_note:str|None,request_id:str)->Review:
     if event.version != expected_version: raise HTTPException(409,"event version conflict")
+    if event.merged_into_event_id is not None: raise HTTPException(409,"merged event cannot be reviewed")
     if decision == ReviewDecision.approve: await require_publishable(db,event,reason)
     elif not (reason or "").strip(): raise HTTPException(422,"reason is required")
     before=snapshot(event)
@@ -75,36 +92,42 @@ async def review_event(db:AsyncSession,event:Event,user:User,decision:ReviewDeci
     revision=EventRevision(event_id=event.id,version=event.version,changed_by_id=user.id,before_values=before,after_values=after,reason=reason or decision.value)
     db.add_all([review,revision]); await db.flush(); event.current_revision_id=revision.id
     if decision==ReviewDecision.reject:
-        candidates=(await db.scalars(select(EventClusterCandidate).where(EventClusterCandidate.status==ClusterCandidateStatus.pending,((EventClusterCandidate.event_id==event.id)|(EventClusterCandidate.candidate_event_id==event.id))).with_for_update())).all()
+        candidates=(await db.scalars(select(EventClusterCandidate).where(EventClusterCandidate.status!=ClusterCandidateStatus.dismissed,((EventClusterCandidate.event_id==event.id)|(EventClusterCandidate.candidate_event_id==event.id))).order_by(EventClusterCandidate.id).with_for_update())).all()
         for candidate in candidates:
-            candidate.status=ClusterCandidateStatus.dismissed; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
-            db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_invalidated",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id,before_values={"status":"pending"},after_values={"status":"dismissed"},details={"reason":"event rejected","event_id":str(event.id)}))
+            old_status=candidate.status.value; candidate.status=ClusterCandidateStatus.dismissed; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
+            db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_invalidated",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id,before_values={"status":old_status},after_values={"status":"dismissed"},details={"reason":"event rejected","event_id":str(event.id)}))
     _audit(db,user,"event.reviewed",event.id,request_id,before,after,{"decision":decision.value,"review_id":str(review.id)})
     return review
 
 async def merge_events(db:AsyncSession,target:Event,source:Event,user:User,target_version:int,source_version:int,reason:str,request_id:str)->Event:
     if target.id==source.id: raise HTTPException(422,"cannot merge an event into itself")
+    locked=(await db.scalars(select(Event).where(Event.id.in_(sorted((target.id,source.id),key=str))).order_by(Event.id).with_for_update())).all()
+    if len(locked)!=2: raise HTTPException(404,"event not found")
+    by_id={event.id:event for event in locked}; target,source=by_id[target.id],by_id[source.id]
     if target.version!=target_version or source.version!=source_version: raise HTTPException(409,"event version conflict")
     if target.merged_into_event_id is not None or source.merged_into_event_id is not None: raise HTTPException(409,"merged event cannot be merged again")
     links=(await db.scalars(select(EventArticle).where(EventArticle.event_id==source.id).with_for_update())).all()
     target_links=(await db.scalars(select(EventArticle).where(EventArticle.event_id==target.id).with_for_update())).all()
     source_membership_before=membership_snapshot(links); target_membership_before=membership_snapshot(target_links)
-    existing={link.article_id for link in target_links}; target_has_primary=any(link.is_primary_source for link in target_links)
+    existing={link.article_id for link in target_links}; existing_primary=next((link.article_id for link in target_links if link.is_primary_source),None); source_primary=next((link.article_id for link in links if link.is_primary_source),None)
+    preferred_primary=existing_primary or source_primary or min(existing|{link.article_id for link in links},key=str,default=None)
     for link in links:
         if link.article_id not in existing:
-            make_primary=not target_has_primary and link.is_primary_source
-            db.add(EventArticle(event_id=target.id,article_id=link.article_id,similarity_score=link.similarity_score,is_primary_source=make_primary,link_reason=f"human merge: {reason}")); target_has_primary=target_has_primary or make_primary
+            db.add(EventArticle(event_id=target.id,article_id=link.article_id,similarity_score=link.similarity_score,is_primary_source=link.article_id==preferred_primary,link_reason=f"human merge: {reason}"))
         await db.delete(link)
+    if existing_primary is None:
+        matching=next((link for link in target_links if link.article_id==preferred_primary),None)
+        if matching is not None: matching.is_primary_source=True
     source_before=snapshot(source); source.publication_status=PublicationStatus.hidden; source.merged_into_event_id=target.id; source.version+=1
     target_before=snapshot(target); target.publication_status=PublicationStatus.needs_review; target.version+=1
     for event,before in ((target,target_before),(source,source_before)):
         rev=EventRevision(event_id=event.id,version=event.version,changed_by_id=user.id,before_values=before,after_values=snapshot(event),reason=reason); db.add(rev); await db.flush(); event.current_revision_id=rev.id
     await db.flush()
     target_membership_after=membership_snapshot((await db.scalars(select(EventArticle).where(EventArticle.event_id==target.id))).all())
-    candidates=(await db.scalars(select(EventClusterCandidate).where(EventClusterCandidate.status==ClusterCandidateStatus.pending,((EventClusterCandidate.event_id.in_([target.id,source.id]))|(EventClusterCandidate.candidate_event_id.in_([target.id,source.id])))).with_for_update())).all()
+    candidates=(await db.scalars(select(EventClusterCandidate).where(EventClusterCandidate.status!=ClusterCandidateStatus.dismissed,((EventClusterCandidate.event_id.in_([target.id,source.id]))|(EventClusterCandidate.candidate_event_id.in_([target.id,source.id])))).order_by(EventClusterCandidate.id).with_for_update())).all()
     for candidate in candidates:
-        candidate.status=ClusterCandidateStatus.dismissed; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
-        db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_invalidated",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id,before_values={"status":"pending"},after_values={"status":"dismissed"},details={"reason":"event merged","target_event_id":str(target.id),"source_event_id":str(source.id)}))
+        old_status=candidate.status.value; candidate.status=ClusterCandidateStatus.dismissed; candidate.reviewed_by_id=user.id; candidate.reviewed_at=datetime.now(UTC)
+        db.add(AuditLog(actor_user_id=user.id,action="event.cluster_candidate_invalidated",entity_type="event_cluster_candidate",entity_id=str(candidate.id),request_id=request_id,before_values={"status":old_status},after_values={"status":"dismissed"},details={"reason":"event merged","target_event_id":str(target.id),"source_event_id":str(source.id)}))
     membership_details={"source_event_id":str(source.id),"reason":reason,"target_membership_before":target_membership_before,"source_membership_before":source_membership_before,"target_membership_after":target_membership_after,"moved_article_ids":[str(link.article_id) for link in links if link.article_id not in existing],"duplicate_article_ids":[str(link.article_id) for link in links if link.article_id in existing]}
     _audit(db,user,"event.merged",target.id,request_id,target_before,snapshot(target),membership_details)
     _audit(db,user,"event.merged_into",source.id,request_id,source_before,snapshot(source),membership_details)
@@ -149,9 +172,17 @@ async def generate_cluster_candidates(factory:async_sessionmaker[AsyncSession],e
         event=await db.get(Event,event_id)
         if event is None: raise RuntimeError("event not found")
         if event.publication_status==PublicationStatus.hidden or event.merged_into_event_id is not None: return
-        peers=(await db.scalars(select(Event).where(Event.id!=event.id,Event.publication_status!=PublicationStatus.hidden,Event.merged_into_event_id.is_(None),Event.event_date.between(event.event_date-timedelta(days=3),event.event_date+timedelta(days=3))).limit(200))).all()
-        for peer in peers:
-            first,second=sorted((event.id,peer.id),key=str); score=title_similarity(event.title_ja,peer.title_ja)
+        peer_ids=(await db.scalars(select(Event.id).where(Event.id!=event.id,Event.event_date.between(event.event_date-timedelta(days=3),event.event_date+timedelta(days=3))).order_by(Event.id).limit(200))).all()
+        participant_ids=sorted({event.id,*peer_ids},key=str)
+        # One globally ordered lock acquisition prevents crossed peer sets from
+        # taking A→B and B→C locks in different sequences.
+        locked=(await db.scalars(select(Event).where(Event.id.in_(participant_ids)).order_by(Event.id).with_for_update())).all()
+        by_id={value.id:value for value in locked}; root=by_id.get(event.id)
+        if root is None or root.publication_status==PublicationStatus.hidden or root.merged_into_event_id is not None: return
+        for peer_id in peer_ids:
+            peer=by_id.get(peer_id)
+            if peer is None or peer.publication_status==PublicationStatus.hidden or peer.merged_into_event_id is not None: continue
+            first,second=sorted((root.id,peer.id),key=str); score=title_similarity(by_id[first].title_ja,by_id[second].title_ja)
             if score < .55: continue
             candidate_id=uuid.uuid4()
             statement=insert(EventClusterCandidate).values(id=candidate_id,event_id=first,candidate_event_id=second,similarity_score=score,reasons=["title_similarity","nearby_event_date"],status=ClusterCandidateStatus.pending).on_conflict_do_nothing(constraint="uq_event_cluster_pair").returning(EventClusterCandidate.id)
